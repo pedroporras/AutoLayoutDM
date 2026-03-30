@@ -1,22 +1,27 @@
-# Resumen completo del trabajo realizado con RICO → LayoutDM
+# Resumen completo del trabajo realizado con RICO → LayoutDM / UI-Diffuser
 
 ## 1. Objetivo general
 
-La meta de todo este trabajo fue entender **LayoutDM** como si fuera un sistema de ingeniería y no como un paper académico, y construir un pipeline completo para usar el dataset **RICO semantic annotations** como entrada.
+La meta de todo este trabajo fue construir la parte de **generación de layouts** del pipeline de **UI-Diffuser**, usando:
 
-La idea central es esta:
+* **RICO** como dataset real de interfaces Android
+* **LayoutDM** como modelo generativo discreto de layouts
+* una tokenización de cada elemento UI en la forma `(c, x, y, w, h)`
 
-* tenemos un dataset de interfaces (`RICO`)
+La idea central es:
+
+* leemos los archivos JSON de anotaciones semánticas de RICO
 * extraemos de cada pantalla una lista de elementos visuales
-* convertimos esos elementos a una representación estructurada
-* discretizamos esa representación a tokens
+* convertimos cada elemento a una representación estructurada y discreta
 * exportamos esos tokens para entrenamiento
-* entrenamos un modelo de **diffusion discreto** para generar layouts
+* entrenamos un modelo de **diffusion discreto** para generar layouts plausibles
 * depuramos problemas como solapamientos, alineaciones raras o salidas incoherentes
+
+La meta no era todavía generar una imagen UI final con Stable Diffusion, sino primero dejar bien la etapa previa: **aprender a generar layouts plausibles**.
 
 En otras palabras:
 
-**RICO JSON → elementos UI → tokens discretos → LayoutDM**
+**RICO JSON → elementos UI → tokens discretos → LayoutDM → layouts generados**
 
 ---
 
@@ -32,31 +37,51 @@ Un layout aquí significa:
 
 Por ejemplo, en una pantalla móvil:
 
-* un botón
-* un título
-* una imagen
-* una caja de texto
+* un botón, un título, una imagen, una caja de texto
 
-El modelo no genera la imagen final de la UI.
-Lo que genera es la **estructura geométrica**:
-
-* categoría del elemento
-* posición
-* tamaño
-
-Formalmente, cada elemento se representa como:
+El modelo **no genera la imagen final** de la UI. Genera la **estructura geométrica**:
 
 `(c, x, y, w, h)`
 
 donde:
 
-* `c` = categoría
-* `x, y` = centro del elemento
-* `w, h` = ancho y alto
+* `c` = categoría del elemento
+* `x, y` = centro del bounding box normalizado
+* `w, h` = ancho y alto normalizados
 
 ---
 
-# 3. Cómo pensamos el sistema completo
+# 3. Estado inicial del proyecto
+
+## 3.1. Qué ya existía al inicio
+
+Al inicio ya existían varias piezas importantes:
+
+* arquitectura general de LayoutDM (Transformer encoder como denoiser)
+* training loop base con pérdida `VB + auxiliary`
+* muestreo incondicional básico
+* blueprint del modelo
+* pipeline inicial de preprocesamiento de RICO
+
+Había una base funcional para arrancar.
+
+## 3.2. Qué faltaba o estaba incompleto
+
+También había brechas importantes:
+
+* el dataset real de RICO no estaba conectado al blueprint (usaba datos dummy)
+* no estaba validado que el preprocesamiento fuera compatible con el blueprint
+* faltaba el shuffle por elemento
+* faltaban sanity checks visuales sólidos
+* el schedule del paper no era exacto
+* el flatten del modelo no seguía la estructura intercalada del paper
+* `M` estaba fijo en `25` en lugar de calcularse desde los datos reales
+
+La conclusión fue clara: antes de optimizar o comparar métricas, había que cerrar bien el pipeline real de datos y entrenamiento.
+
+---
+
+# 4. Cómo pensamos el sistema completo
 
 Todo el sistema se puede dividir en dos grandes partes:
 
@@ -70,11 +95,11 @@ Entrena LayoutDM sobre esos tensores discretos.
 
 ---
 
-# 4. Qué vimos paso a paso
+# 5. Qué vimos paso a paso
 
 ---
 
-## 4.1. Lectura del dataset RICO
+## 5.1. Lectura del dataset RICO
 
 RICO no viene listo para LayoutDM.
 
@@ -99,11 +124,11 @@ La lógica del parser:
 1. recorrer recursivamente todos los nodos (`children`)
 2. leer `bounds` de cada nodo
 3. convertirlos a coordenadas normalizadas
-4. guardar cada nodo como un elemento estructurado usando `componentLabel` si existe, `class` si no
+4. guardar cada nodo usando `componentLabel` si existe, `class` si no
 
 ---
 
-## 4.2. Problema inicial: `Invalid screen size from root bounds`
+## 5.2. Problema inicial: `Invalid screen size from root bounds`
 
 Al ejecutar el builder apareció este error en algunos archivos:
 
@@ -119,23 +144,18 @@ Se reforzó el parser para:
 
 1. intentar normalizar bounds (interpretar como `[x0,y0,x1,y1]` o como `[x,y,w,h]`)
 2. inferir el tamaño de pantalla desde el árbol completo cuando el root no era válido
-3. si no había forma de inferirlo, saltarse ese archivo y registrar warning
+3. saltarse el archivo y registrar warning si no había forma de inferirlo
 
 ### Resultado real del dataset
 
 * **66 195 screens** se pudieron procesar correctamente
-* **66 archivos** no pudieron parsearse porque realmente no tenían geometría utilizable
-
-Esto no es un bug del pipeline, sino una condición real del dataset.
+* **66 archivos** no pudieron parsearse (geometría inválida — condición real del dataset)
 
 ---
 
-## 4.3. Estadísticas del dataset y elección de `M`
+## 5.3. Estadísticas del dataset y elección de `M`
 
-`M` es el número máximo de elementos por pantalla. Como cada pantalla tiene distinto número de elementos, `M` define la longitud fija del tensor:
-
-* si una pantalla tiene menos de `M` elementos → se rellena con `PAD`
-* si tiene más de `M` → se recorta
+`M` es el número máximo de elementos por pantalla — define la longitud fija del tensor. Pantallas con menos de `M` elementos → `PAD`. Con más → truncar.
 
 Estadísticas reales del conteo de elementos por pantalla:
 
@@ -152,15 +172,11 @@ Estadísticas reales del conteo de elementos por pantalla:
 M = p95 = 55
 ```
 
-Esto es razonable porque:
-
-* captura el 95% de las pantallas sin truncamiento
-* evita que unos pocos outliers (hasta 423 elementos) inflen el tensor innecesariamente
-* permite un entrenamiento mucho más estable que usar el máximo absoluto
+Esto captura el 95% de las pantallas sin truncamiento y evita que outliers (hasta 423 elementos) inflen el tensor. Es un cambio importante respecto al `M=25` fijo del blueprint original.
 
 ---
 
-## 4.4. Split del dataset
+## 5.4. Split del dataset
 
 Se dividieron las **pantallas válidas** (las 66 195) en:
 
@@ -172,68 +188,31 @@ Se dividieron las **pantallas válidas** (las 66 195) en:
 
 Proporciones: 80 / 10 / 10, reproducible con `SEED = 42`.
 
-**Importante**: el split se hizo sobre `len(screens)` (pantallas parseables), no sobre `len(json_files)` (total de archivos). Esa distinción fue clave para evitar el bug de índices descrito en la sección 6.
+**Importante**: el split se hizo sobre `len(screens)` (pantallas parseables), no sobre `len(json_files)` (total de archivos). Esa distinción fue clave para evitar el bug de índices descrito en la sección 7.
 
 ---
 
-## 4.5. Construcción del vocabulario de categorías
+## 5.5. Construcción del vocabulario de categorías
 
 A partir del split train se creó `cat2id` usando **solo train**:
 
-```json
-{
-  "Button": 0,
-  "Web View": 1,
-  "Text": 2,
-  ...
-}
-```
-
-Resultado real: **25 categorías** en train.
-
-Igual que en las modalidades espaciales, se reservaron ids especiales:
-
-* `mask_id = C`
-* `pad_id = C + 1`
-
-donde `C = 25`.
+Resultado real: **25 categorías** en train, con ids especiales `mask_id = C` y `pad_id = C + 1`.
 
 ---
 
-## 4.6. Discretización geométrica con KMeans
+## 5.6. Discretización geométrica con KMeans
 
-LayoutDM no usa coordenadas continuas.
-Usa coordenadas **discretizadas**.
-
-Para eso se entrenaron 4 KMeans independientes sobre el split de train:
-
-* uno para `x`
-* uno para `y`
-* uno para `w`
-* uno para `h`
-
-Con `BINS = 64` clusters cada uno.
-
-### Por qué 64 bins
-
-Balance entre:
-
-* suficiente resolución espacial
-* vocabulario no demasiado grande
-* entrenamiento estable
+Se entrenaron 4 KMeans independientes sobre el split de train, con `BINS = 64` clusters cada uno.
 
 Con 64 bins por modalidad:
 
 * `x_id, y_id, w_id, h_id` quedan en `0..63`
-* `mask_id = 64`
-* `pad_id = 65`
+* `mask_id = 64`, `pad_id = 65`
 * vocabulario por modalidad geométrica: `64 + 2 = 66`
 
 ---
 
-## 4.7. Exportación de artefactos
-
-El pipeline exportó los siguientes archivos en `OUT_DIR`:
+## 5.7. Exportación de artefactos
 
 | Archivo | Contenido |
 |---|---|
@@ -243,171 +222,215 @@ El pipeline exportó los siguientes archivos en `OUT_DIR`:
 | `centroids_x/y/w/h.pt` | `FloatTensor [64]` por modalidad |
 | `cat2id.json` | `{ "Button": 0, ... }` |
 | `vocab_meta.json` | vocab sizes, pad/mask ids, M, bins, seed, split ratios |
+| `split_ids.json` | IDs reales por split (train/val/test) |
 
 El formato de `vocab_meta.json` es el contrato entre preprocesamiento y training loop.
 
 ---
 
-# 5. Validación del preprocesamiento
+# 6. Validación del preprocesamiento
 
----
-
-## 5.1. Validación estadística
-
-Se verificó:
+## 6.1. Validación estadística
 
 * shape de `train_tokens`: `(52956, 55, 5)` ✅
 * dtype: `torch.int64` ✅
-* rangos de ids dentro de los vocabs esperados
-* consistencia del padding
+* rangos de ids dentro de los vocabs esperados ✅
+* consistencia del padding ✅
 
----
-
-## 5.2. Validación visual
+## 6.2. Validación visual
 
 Se generaron overlays sobre screenshots reales, dibujando cajas reconstruidas desde los tokens:
 
 1. tomar una pantalla por `screen_id`
 2. decodificar sus tokens usando centroides
 3. dibujar los bounding boxes sobre la imagen real
-4. verificar si quedaban alineados con los elementos de la UI
+4. verificar alineación con los elementos de la UI
 
 ### Qué se observó inicialmente
 
-Los layouts parecían mal alineados en varios casos. Esto sugería alguno de estos problemas:
-
-* mala normalización
-* centroides incorrectos
-* screen size mal calculado
-* desalineación entre JSON e imagen
-* o error en el mapeo entre token row y pantalla original
+Los layouts parecían mal alineados en varios casos — lo que inicialmente sugería mala normalización, centroides incorrectos o error en el mapeo entre token row y pantalla original.
 
 ---
 
-# 6. Depuración del caso concreto: pantalla `"0"`
+# 7. Depuración del caso concreto: pantalla `"0"`
 
-Se analizó una pantalla específica con JSON muy simple:
+Se analizó una pantalla con JSON muy simple:
 
 * root: `[0, 0, 1440, 2560]`
 * un solo hijo: clase `SystemWebView`, bounds `[0, 0, 1440, 2392]`
 
----
+**Lo esperado**: 1 elemento, `x=0.5, y=0.467, w=1.0, h=0.934`.
 
-## 6.1. Lo esperado geométricamente
+**Lo observado**: `decode_row_to_boxes` devolvía 7 cajas pequeñas concentradas arriba.
 
-Esa pantalla debería producir exactamente **1 elemento** con:
+### Diagnóstico real
 
-* `x = 0.5`
-* `y = 0.4671875`
-* `w = 1.0`
-* `h = 0.934375`
-
-Una caja casi de pantalla completa.
-
----
-
-## 6.2. Lo que devolvía el decode inicialmente
-
-El `decode_row_to_boxes` devolvía **7 cajas** pequeñas, concentradas arriba:
-
-* `y ≈ 0.064`
-* `h ≈ 0.065`
-* varias cajas tipo toolbar/lista
-
-Eso no coincidía en nada con el JSON.
-
----
-
-## 6.3. Diagnóstico real
-
-Se reconstruyó el mapeo exacto entre `screens`, split train y posición en `tokens_train`:
+Se reconstruyó el mapeo exacto:
 
 ```
-idx_in_screens:    0
-split_name:        train
+idx_in_screens:      0
+split_name:          train
 pos_in_split_tokens: 44822
-real_n (non-pad elems): 1
+real_n (non-pad):    1
 ```
 
-### Conclusión
+El problema **no era** la tokenización. Se estaba mirando `train_tokens[0]` cuando el screen `"0"` estaba en `train_tokens[44822]`. Causa: scripts de debug usaban índices basados en `json_files` completos (incluyendo los 66 fallidos), desplazando el índice.
 
-El problema **no era** la tokenización ni el decode.
+### Lección aprendida
 
-El problema era que se estaba inspeccionando el row incorrecto:
+> Nunca asumir que `tokens_train[i]` corresponde al archivo `i.json`.
 
-* se miraba `train_tokens[0]`
-* pero el screen `"0"` estaba en `train_tokens[44822]`
-
-Esto ocurrió porque el split se hizo sobre `screens` válidos, mientras que los scripts de debug usaban índices basados en `json_files` completos, incluyendo los 66 archivos fallidos. Eso desplazaba el índice.
+**Solución implementada**: exportar `split_ids.json` desde `main()` con los IDs reales por split.
 
 ---
 
-## 6.4. Lección aprendida
+# 8. Problemas de integración preprocessing ↔ blueprint
 
-> En datasets preprocesados **nunca** se debe asumir que `tokens_train[i]` corresponde al archivo `i.json`.
+Una vez se conectó el dataset real al blueprint del modelo, aparecieron varios problemas. Esto fue bueno: significaba que el pipeline ya estaba ejecutándose de verdad.
 
-Puede haber archivos descartados, shuffles, splits o filtros previos que desplacen los índices.
+## 8.1. `pad_mask` incorrecto
 
-### Solución recomendada
+El blueprint asumía un único `pad_id` global, pero el preprocesamiento genera PAD por modalidad:
 
-Guardar siempre los ids exactos por split:
+* `pad_id = C + 1` para categoría
+* `pad_id = BINS + 1` para `x/y/w/h`
 
-```python
-# En el builder, al final de main():
-with open(os.path.join(OUT_DIR, "ids_train.json"), "w", encoding="utf-8") as f:
-    json.dump([s["id"] for s in train_screens], f, indent=2)
+Solución: construir `pad_mask` iterando solo sobre `["c", "x", "y", "w", "h"]`.
 
-with open(os.path.join(OUT_DIR, "ids_val.json"), "w", encoding="utf-8") as f:
-    json.dump([s["id"] for s in val_screens], f, indent=2)
+## 8.2. `M` fijo en el blueprint
 
-with open(os.path.join(OUT_DIR, "ids_test.json"), "w", encoding="utf-8") as f:
-    json.dump([s["id"] for s in test_screens], f, indent=2)
-```
+El modelo usaba `M=25` fijo. Con datos reales, el valor calculado fue `M=55`. Hubo que propagar este valor desde `vocab_meta.json`.
 
-Así el debug y los overlays se hacen por `screen_id`, no por posición asumida.
+## 8.3. Dataset dummy en el blueprint
+
+El modelo creaba un dataset falso en memoria. Se cambió para leer `tokens_train.pt` y `tokens_val.pt` desde disco.
+
+## 8.4. Flatten no compatible con el paper
+
+El `forward()` organizaba la secuencia por bloques de modalidad, cuando el paper espera una secuencia **intercalada por elemento** (cada elemento aporta sus 5 tokens consecutivos). Esto afectaba directamente qué dependencias aprendía el Transformer.
+
+## 8.5. Falta de shuffle por elemento
+
+El paper requiere mezclar el orden de los elementos del layout para evitar que el modelo dependa de un orden artificial. Quedó como pendiente de implementar.
+
+## 8.6. Errores en la indexación temporal de `Q_t`
+
+Aparecieron varios `IndexError: list index out of range` porque las listas `Qts_all` y `Qbars_all` se indexaban con `t` directamente, cuando están almacenadas desde índice `0`.
+
+Convención correcta:
+
+* `Q_t` → `Qts_all[m][t - 1]`
+* `Qbar_t` → `Qbars_all[m][t - 1]`
+* `Qbar_{t-1}` → `Qbars_all[m][t - 2]` (si `t == 1`, usar `I`)
+
+## 8.7. Firma incorrecta de `build_Qt`
+
+`mask_id` llegaba como float por un desorden de argumentos posicionales. Se corrigió usando argumentos nombrados.
 
 ---
 
-# 7. Aspectos importantes que no se deben olvidar
+# 9. Entrenamiento exitoso y primera generación
 
-## 7.1. El preprocesamiento no es solo conversión de formato
+## 9.1. Entrenamiento
 
-También define qué elementos entran, cómo se normalizan, cómo se discretizan, y qué información pierde o conserva el modelo. Eso impacta directamente la calidad de LayoutDM.
+Después de corregir los puntos anteriores, el entrenamiento ejecutó end-to-end:
 
-## 7.2. `M` es una decisión crítica
+* el modelo sí entrenaba con datos reales
+* la loss bajaba sin colapso inmediato
+* el pipeline completo corría desde RICO hasta un checkpoint
 
-* Si `M` es muy bajo: truncas layouts complejos
-* Si `M` es muy alto: entrenas con mucho padding y el modelo es menos eficiente
+## 9.2. Primera prueba de generación
 
-Usar `p95 = 55` fue una decisión equilibrada.
+Se hizo muestreo incondicional y se renderizaron layouts generados.
 
-## 7.3. KMeans introduce cuantización
+### Lo que se observó
 
-Cuando reconstruyes desde tokens, no obtienes los valores exactos originales: obtienes una aproximación por centroides. Eso es normal. Por eso un pequeño error entre la caja real y la reconstruida en un overlay no siempre significa bug.
+**Positivo:**
+* categorías plausibles: `Text`, `Image`, `List Item`
+* elementos dentro del canvas
+* cierta estructura vertical de pantalla móvil
 
-## 7.4. La trazabilidad screen_id ↔ token row es obligatoria
+**Problemático:**
+* demasiados overlaps
+* muchas cajas horizontales largas
+* amontonamiento en zonas centrales
+* layouts poco naturales
 
-Sin esa trazabilidad puedes diagnosticar mal el pipeline y creer que el modelo o el preprocesamiento fallan cuando en realidad estás mirando otro ejemplo.
+**Conclusión**: como sanity check básico, aceptable. Como calidad final, todavía insuficiente.
 
-## 7.5. El schedule de diffusion debe ser el exacto del paper
+## 9.3. Confirmación del problema del flatten
 
-En el notebook quedó como placeholder `make_transition_params()`. La arquitectura estaba bien, pero no era una réplica exacta hasta reemplazar esa función.
+Se renderizaron varios samples y todos repetían el mismo patrón. Eso confirmó que no era una mala muestra aislada sino un problema sistémico.
 
-## 7.6. El shuffle de elementos por sample todavía faltaba
+Al corregir el flatten intercalado, el resultado mejoró ligeramente — pero no fue suficiente por sí solo.
 
-El paper busca que el modelo no dependa del orden de los elementos. En una implementación más fiel, el `Dataset` debería hacer shuffle de los slots válidos antes de devolver cada muestra.
+---
 
-## 7.7. LayoutDM no entiende semántica profunda
+# 10. Diagnóstico actual del proyecto
+
+## 10.1. Qué ya se puede afirmar
+
+* el dataset real sí está conectado al modelo ✅
+* el entrenamiento ya corre con artefactos reales ✅
+* el modelo sí aprende algo ✅
+* el rendering de samples generados funciona ✅
+* el flatten intercalado mejora el comportamiento ✅
+
+## 10.2. Sospechosos actuales de la baja calidad
+
+### a. Schedule del paper no exacto
+
+La implementación sigue usando una versión aproximada del schedule de transición discreta.
+
+### b. Sampling reverso posiblemente mal calibrado
+
+Aunque el entrenamiento corre, el bloque de sampling puede seguir incorrecto o incompleto.
+
+### c. `M=55` puede estar sobrecargando los layouts
+
+Un valor alto de `M` deja demasiado espacio para generar layouts saturados.
+
+### d. RICO sin filtrado estructural mete ruido
+
+Tomar todos los elementos sin filtrado mínimo puede empeorar la calidad estructural del dataset de entrenamiento.
+
+---
+
+# 11. Aspectos importantes que no se deben olvidar
+
+## 11.1. El dataset real era la prioridad correcta
+
+Antes de métricas, constraints o mejoras visuales, había que hacer que el pipeline leyera datos reales y el render confirmara si el sistema aprendía algo. Ese orden fue correcto.
+
+## 11.2. La compatibilidad entre preprocessing y training no era automática
+
+Aunque ambos lados "parecían" correctos en aislamiento, en la práctica hubo que alinear: `M`, `pad_mask`, `vocab_meta`, `Q_t` y `Qbar_t`, estructura del flatten.
+
+## 11.3. Una loss que baja no garantiza buenos layouts
+
+El entrenamiento puede parecer sano numéricamente y aun así producir layouts malos si la secuencia está mal estructurada, el reverse sampling está mal, o el schedule discreto está aproximado.
+
+## 11.4. Los sanity checks visuales son críticos
+
+Renderizar muestras fue lo que permitió detectar que el problema era estructural y sistémico, no un error de implementación aislado.
+
+## 11.5. La trazabilidad screen_id ↔ token row es obligatoria
+
+Sin ella, puedes diagnosticar mal el pipeline y creer que el modelo falla cuando en realidad estás mirando otro ejemplo.
+
+## 11.6. KMeans introduce cuantización — eso es normal
+
+Un pequeño error entre caja real y reconstruida en un overlay no siempre significa bug.
+
+## 11.7. LayoutDM no entiende semántica profunda
 
 Solo aprende patrones geométricos y categóricos. No sabe qué es "header" o "CTA" como concepto de producto.
 
 ---
 
-# 8. Qué implementamos para el entrenamiento
+# 12. Qué implementamos para el entrenamiento
 
----
-
-## 8.1. Entrada del modelo
+## 12.1. Entrada del modelo
 
 ```python
 tokens: [B, M, 5]
@@ -415,75 +438,43 @@ tokens: [B, M, 5]
 
 Cada token representa `(category, x, y, w, h)` en forma discreta.
 
----
+## 12.2. Arquitectura
 
-## 8.2. Arquitectura
+**Transformer encoder** como denoiser, no autoregresivo. LayoutDM modela el layout completo sin depender de un orden fijo.
 
-Usamos un **Transformer encoder** como denoiser.
+## 12.3. Difusión discreta (modality-wise)
 
-No es autoregresivo, no es decoder-only, no genera token por token. LayoutDM modela el layout completo sin depender de un orden fijo.
+Hay una difusión separada por modalidad (`c`, `x`, `y`, `w`, `h`). Esto evita mezclar vocabularios incompatibles. Se usan matrices:
 
----
+* `Q_t`: distribución de transición en un paso
+* `Qbar_t`: distribución acumulada desde `t=0`
 
-## 8.3. Proceso de diffusion
-
-Durante entrenamiento:
-
-1. tomamos un layout limpio `z0`
-2. elegimos un timestep `t`
-3. corrompemos `z0` → `zt`
-4. el modelo predice una versión más limpia
-
-Eso se hace con **diffusion discreto**.
-
----
-
-## 8.4. Modality-wise diffusion
-
-Hay una difusión separada por modalidad (`c`, `x`, `y`, `w`, `h`). Esto evita mezclar vocabularios incompatibles. Una categoría no debería transformarse en un ancho.
-
----
-
-## 8.5. Loss
-
-El entrenamiento usa dos partes combinadas:
-
-### VB loss
-
-KL entre el posterior verdadero del diffusion y el posterior predicho por el modelo. Es el corazón teórico del modelo.
-
-### Aux loss
-
-Cross entropy para ayudar al modelo a reconstruir `z0`. Estabiliza el entrenamiento.
+## 12.4. Loss
 
 ```text
-loss_total = vb_loss + lambda_aux * aux_loss
-             con lambda_aux = 0.1
+loss_total = vb_loss + lambda_aux * aux_loss    (lambda_aux = 0.1)
 ```
 
----
+* **VB loss**: KL entre el posterior verdadero y el predicho por el modelo
+* **Aux loss**: cross entropy para reconstruir `z0` — estabiliza entrenamiento
 
-## 8.6. Máscara de PAD
+## 12.5. Máscara de PAD
 
-Los slots PAD no representan elementos reales. Se construyó `pad_mask` para que la loss se calcule **solo sobre tokens válidos**. Si PAD entra en la loss, el modelo aprende una distribución errónea.
+Se construye `pad_mask` para que la loss se calcule **solo sobre tokens válidos**. Si PAD entra en la loss, el modelo aprende una distribución errónea.
 
----
-
-## 8.7. Unconditional sampling
+## 12.6. Unconditional sampling
 
 En inferencia:
 
-1. se inicia todo en `[MASK]`
-2. se corre el reverse diffusion de `T` hasta `1`
+1. iniciar todo en `[MASK]`
+2. correr reverse diffusion de `T` hasta `1`
 3. en cada paso el modelo predice distribuciones sobre tokens
-4. se samplea categóricamente
-5. al final se obtiene `z0`
-
-Esto produce un layout nuevo desde cero.
+4. samplear categóricamente
+5. obtener `z0`
 
 ---
 
-# 9. Explicación separada: Preprocesamiento completo
+# 13. Explicación separada: Preprocesamiento completo
 
 ## Objetivo
 
@@ -493,17 +484,13 @@ Transformar cada pantalla de RICO en una secuencia discreta utilizable por Layou
 
 ### Paso 1. Leer cada JSON
 
-Se abre cada archivo en `semantic_annotations/` en orden alfabético (determinista).
+Orden alfabético — determinista y reproducible.
 
 ### Paso 2. Recorrer el árbol
 
-Se recorren root y `children` recursivamente en pre-order.
+Pre-order, root + todos los `children` recursivamente.
 
-### Paso 3. Extraer bounds
-
-De cada nodo se toman `[x0, y0, x1, y1]`.
-
-### Paso 4. Convertir a `(x, y, w, h)` normalizado
+### Paso 3. Extraer y normalizar bounds
 
 ```text
 x = (x0 + x1) / 2 / screen_w
@@ -512,51 +499,45 @@ w = (x1 - x0) / screen_w
 h = (y1 - y0) / screen_h
 ```
 
-La resolución de pantalla se infiere haciendo snapping al candidato RICO más cercano (`720×1280`, `1080×1920`, `1440×2560`).
+La resolución de pantalla se infiere haciendo snapping al candidato RICO más cercano: `720×1280`, `1080×1920`, `1440×2560`.
 
-### Paso 5. Determinar la categoría
+### Paso 4. Determinar la categoría
 
 Prioridad: `componentLabel` > `class` > `"UNKNOWN"`
 
-### Paso 6. Construir lista de elementos por pantalla
+### Paso 5. Calcular estadísticas y elegir `M`
 
-```python
-{"category": ..., "x": ..., "y": ..., "w": ..., "h": ...}
-```
+`M = ceil(percentil_95)` — resultado real: `M = 55`.
 
-### Paso 7. Calcular estadísticas y elegir `M`
+### Paso 6. Construir `good_ids` / `bad_ids`
 
-`M = ceil(percentil_95)` sobre el conteo de elementos reales.
+Filtrar a solo pantallas parseables antes del split. El split opera sobre esta lista.
 
-### Paso 8. Construir `good_ids` / `bad_ids`
-
-Antes de hacer el split, se filtra la lista a solo las pantallas parseables. El split opera sobre esta lista.
-
-### Paso 9. Dividir train/val/test
+### Paso 7. Dividir train/val/test
 
 Shuffle reproducible con `SEED = 42`, proporción 80/10/10.
 
-### Paso 10. Construir `cat2id`
+### Paso 8. Construir `cat2id`
 
-Solo desde train.
+Solo desde train. Resultado: 25 categorías.
 
-### Paso 11. Ajustar KMeans para x/y/w/h
+### Paso 9. Ajustar KMeans para x/y/w/h
 
-Solo desde train, con `BINS = 64`.
+Solo desde train, `BINS = 64`. Subsample hasta 2M valores por modalidad para evitar OOM.
 
-### Paso 12. Convertir cada elemento a tokens discretos
+### Paso 10. Tokenizar
 
 ```python
 [c_id, x_id, y_id, w_id, h_id]
 ```
 
-### Paso 13. Aplicar padding hasta `M`
+### Paso 11. Aplicar padding hasta `M`
 
-Posiciones vacías reciben `pad_id` en todas las modalidades.
+Posiciones vacías → `pad_id` en todas las modalidades.
 
-### Paso 14. Exportar artefactos
+### Paso 12. Exportar artefactos
 
-Tokens, centroides, `cat2id.json`, `vocab_meta.json`, y opcionalmente `ids_train/val/test.json`.
+Tokens, centroides, `cat2id.json`, `vocab_meta.json`, `split_ids.json`.
 
 ## Resultado
 
@@ -564,115 +545,108 @@ Tokens, centroides, `cat2id.json`, `vocab_meta.json`, y opcionalmente `ids_train
 tokens_train: LongTensor [52956, 55, 5]
 ```
 
----
+## Señal de que el preprocesamiento está bien
 
-# 10. Explicación separada: Entrenamiento del modelo
-
-## Objetivo
-
-Entrenar un LayoutDM mínimo que aprenda a generar layouts discretos.
-
-## Flujo
-
-### Paso 1. Cargar dataset
-
-`tokens_train.pt`, `tokens_val.pt`, `vocab_meta.json`.
-
-### Paso 2. Construir `LayoutTokenDataset`
-
-Un `Dataset` de PyTorch que devuelve `tokens` por índice.
-
-### Paso 3. Construir el modelo
-
-* embeddings por modalidad
-* positional encoding
-* Transformer encoder
-* head de salida por modalidad
-
-### Paso 4. Precomputar matrices de transición
-
-`Qt` (por timestep) y `Qbar` (acumuladas).
-
-### Paso 5. Loop de entrenamiento
-
-Por cada batch:
-
-* samplear `t`
-* corromper `z0` → `zt`
-* pasar `zt` por el modelo
-* calcular `VB + aux`
-* backpropagation
-
-### Paso 6. Guardar checkpoint
-
-### Paso 7. Unconditional sampling para inspección
-
-## Posibles errores durante el entrenamiento
-
-| Error | Causa |
-|---|---|
-| Mapeo equivocado de datos | Pérdida de trazabilidad `screen_id` ↔ row |
-| Flatten/interleave incorrecto | El orden de tokens no coincide con lo esperado por el modelo |
-| Dataset con mucho ruido | Demasiados layouts atípicos en train |
-| `M` mal elegido | Demasiado truncamiento o demasiado padding |
-| Cuantización inadecuada | Bins no capturan bien la distribución geométrica |
+Si renderizas `tokens_val.pt` reales y los layouts se ven plausibles, el preprocessing está bien encaminado.
 
 ---
 
-# 11. Estado actual del proyecto
+# 14. Explicación separada: Entrenamiento del modelo
+
+## Qué ya funciona
+
+* carga `tokens_*.pt` reales desde disco ✅
+* lee `vocab_meta.json` y usa `M` real ✅
+* construye `pad_mask` correcto por modalidad ✅
+* ejecuta entrenamiento sin errores ✅
+* guarda checkpoint ✅
+* genera muestras renderizables ✅
+
+## Qué sigue faltando
+
+* schedule exacto del paper (reemplazar `make_transition_params()`)
+* revisión del sampling reverso (`q_sample_from_Qbar`, `compute_losses`, `unconditional_sample`)
+* shuffle de elementos por sample en el Dataset
+* mejor validación cualitativa comparando real vs generado
+
+## Cómo se prueba el resultado
+
+No con accuracy tradicional. Se genera y renderiza. Las preguntas clave:
+
+* ¿las cajas están dentro del canvas?
+* ¿los tamaños son plausibles?
+* ¿las clases son coherentes?
+* ¿hay demasiados overlaps?
+* ¿el layout se parece a una UI real?
+
+---
+
+# 15. Estado actual del proyecto
 
 ## Ya resuelto
 
-* parser funcional para la mayoría del dataset (66 195 / 66 261 pantallas)
-* manejo de archivos dañados con warning en lugar de crash
-* cálculo razonable de `M = 55` (p95)
+* parser funcional (66 195 / 66 261 pantallas)
+* manejo de archivos dañados con warning, sin crash
+* `M = 55` calculado desde datos reales (p95)
 * split reproducible (52 956 / 6 619 / 6 620)
 * vocabulario de 25 categorías desde train
-* discretización KMeans train-only con BINS = 64
-* exportación de tokens y metadata
-* validación de shapes, dtype y vocabulario
-* diagnóstico correcto del bug de correspondencia índice ↔ pantalla
-* implementación del training loop mínimo con VB + aux loss
-* implementación de unconditional sampling
+* KMeans train-only con BINS = 64
+* exportación de tokens, centroides, `split_ids.json`
+* trazabilidad `screen_id` ↔ token row resuelta
+* training loop con datos reales (sin dummy)
+* `pad_mask` correcto por modalidad
+* flatten intercalado por elemento
+* entrenamiento e2e funcional
+* generación y render básicos
 
-## Pendiente para una réplica más fiel
+## Pendiente para mayor fidelidad al paper
 
-* guardar `ids_train/val/test.json` en el builder
-* usar el schedule exacto del paper (reemplazar `make_transition_params()`)
-* añadir shuffle por sample en el Dataset
-* validar visualmente los overlays usando `screen_id` como clave
+* schedule exacto de transición discreta
+* auditoría completa del sampling reverso
+* shuffle por elemento en el Dataset
+* validación cruzada real vs generado sobre `tokens_val.pt`
 * comparar métricas con el paper
 
 ---
 
-# 12. Recomendaciones prácticas para continuar
+# 16. Próximos pasos recomendados
 
-1. **Guardar siempre los ids por split** (`ids_train.json`, `ids_val.json`, `ids_test.json`) para poder hacer debug por `screen_id`.
-2. **Guardar `bad_files.json`** para saber qué pantallas quedaron fuera del pipeline.
-3. **Construir el script de debug por `screen_id`**, no por índice posicional en el tensor.
-4. **Validar overlays** con: caja real (rojo), caja reconstruida (verde), error absoluto por `x,y,w,h`.
-5. **Revisar 20-50 ejemplos** antes de entrenar a gran escala: distribución de conteos, comportamiento del padding, coherencia de categorías.
-6. **Ejecutar el preprocesamiento completo** sobre RICO real, revisar las estadísticas de `M` y arrancar con un modelo pequeño.
+## Prioridad alta
 
----
+1. Renderizar muestras reales de `tokens_val.pt` y compararlas con las generadas
+2. Auditar el bloque completo de sampling reverso
+3. Revisar `q_sample_from_Qbar()`, `compute_losses()`, `unconditional_sample()`
 
-# 13. Conclusión
+## Prioridad media
 
-Se logró construir y depurar el pipeline completo de **RICO → tokens discretos para LayoutDM**.
+4. Evaluar bajar `M` (e.g., p90 = 43)
+5. Evaluar filtrado estructural mínimo de RICO
+6. Implementar el schedule exacto del paper
 
-Lo más importante que descubrimos fue que:
+## Prioridad posterior
 
-* el preprocesamiento en sí estaba funcionando razonablemente bien,
-* pero la inspección visual inicial usaba rows equivocados del tensor,
-* lo que generaba una falsa impresión de mala alineación.
-
-La depuración mostró que para trabajar correctamente con LayoutDM no basta con generar tokens: también hay que garantizar una trazabilidad precisa entre archivo fuente, split, posición del tensor y reconstrucción visual.
-
-Con eso resuelto, el siguiente paso natural es conectar estos tokens al entrenamiento de LayoutDM, validar muestras generadas y seguir depurando la calidad de generación.
+7. Añadir shuffle por elemento en el Dataset
+8. Entrenar más epochs con el pipeline corregido
+9. Conectar LayoutDM con UI-Diffuser para generación visual final
 
 ---
 
-# 14. Resumen final simple
+# 17. Conclusión
+
+El trabajo logró pasar de una implementación blueprint parcialmente dummy a un **pipeline real completo** con RICO, tokenización discreta, entrenamiento funcional y generación renderizable.
+
+Lo más importante que aprendimos:
+
+* la compatibilidad entre preprocessing y training **no es automática** — hubo que alinear `M`, `pad_mask`, `vocab_meta`, indexación temporal, y flatten
+* una loss que baja **no garantiza buenos layouts** — los sanity checks visuales son indispensables
+* la trazabilidad `screen_id` ↔ `token_row` es **obligatoria** para debug correcto
+* el primer resultado fue un sanity check positivo, pero la calidad sigue requiriendo ajustes en schedule, sampling y posiblemente `M`
+
+La parte más valiosa es que ahora ya no se depura "en abstracto": hay un sistema real que entrena, genera, falla de manera observable y por eso mismo puede seguir mejorándose de forma dirigida.
+
+---
+
+# 18. Resumen final simple
 
 ### Preprocesamiento
 
@@ -685,13 +659,13 @@ RICO JSON
   → KMeans 1D train-only (BINS=64)
   → discretize
   → pad hasta M=55
-  → tokens.pt [N, 55, 5]
+  → tokens.pt [N, 55, 5]  +  split_ids.json
 ```
 
 ### Entrenamiento
 
 ```
-tokens.pt → diffusion corruption (modality-wise) → Transformer denoiser → VB + aux → reverse sampling
+tokens.pt → pad_mask → diffusion corruption (modality-wise) → Transformer denoiser → VB + aux → reverse sampling
 ```
 
 ### Resultado final
@@ -730,16 +704,27 @@ class LayoutTokensDataset(Dataset):
 # Anexo B: Exportar ids por split en el builder
 
 ```python
-# Al final de main(), añadir:
-with open(os.path.join(OUT_DIR, "ids_train.json"), "w", encoding="utf-8") as f:
-    json.dump([s["id"] for s in train_screens], f, indent=2)
-
-with open(os.path.join(OUT_DIR, "ids_val.json"), "w", encoding="utf-8") as f:
-    json.dump([s["id"] for s in val_screens], f, indent=2)
-
-with open(os.path.join(OUT_DIR, "ids_test.json"), "w", encoding="utf-8") as f:
-    json.dump([s["id"] for s in test_screens], f, indent=2)
-
-with open(os.path.join(OUT_DIR, "bad_files.json"), "w", encoding="utf-8") as f:
-    json.dump(bad, f, indent=2)
+# Exportado automáticamente por main() como split_ids.json:
+split_screen_ids = {
+    "train": [screens[i]["id"] for i in train_idx],
+    "val":   [screens[i]["id"] for i in val_idx],
+    "test":  [screens[i]["id"] for i in test_idx],
+}
+with open(os.path.join(OUT_DIR, "split_ids.json"), "w", encoding="utf-8") as f:
+    json.dump(split_screen_ids, f, ensure_ascii=False, indent=2)
 ```
+
+**Por qué esto es crítico**: `load_all_screens()` filtra los JSONs que fallan al parsear. Cualquier código externo que reconstruya el split usando `len(all_json_files)` obtendrá un `n` distinto → shuffle distinto → desalineamiento índice/token.
+
+---
+
+# Anexo C: Correcciones de integración aplicadas
+
+| Problema | Corrección |
+|---|---|
+| `pad_mask` con un único pad_id | Iterar sobre `["c","x","y","w","h"]` con pad_id por modalidad |
+| `M=25` fijo | Leer `M` desde `vocab_meta["M"]` |
+| Dataset dummy | Cargar `tokens_train.pt` / `tokens_val.pt` desde disco |
+| Flatten por bloques de modalidad | Flatten intercalado por elemento |
+| `Qts_all[m][t]` fuera de rango | Usar `t-1` como índice; para `t==1`, `Qbar_0 = I` |
+| Argumento `mask_id` como float | Usar argumentos nombrados en llamada a `build_Qt()` |
