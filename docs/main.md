@@ -307,11 +307,45 @@ El modelo creaba un dataset falso en memoria. Se cambió para leer `tokens_train
 
 ## 8.4. Flatten no compatible con el paper
 
-El `forward()` organizaba la secuencia por bloques de modalidad, cuando el paper espera una secuencia **intercalada por elemento** (cada elemento aporta sus 5 tokens consecutivos). Esto afectaba directamente qué dependencias aprendía el Transformer.
+El `forward()` organizaba la secuencia por **bloques de modalidad**:
 
-## 8.5. Falta de shuffle por elemento
+```text
+[c1..cM, x1..xM, y1..yM, w1..wM, h1..hM]
+```
 
-El paper requiere mezclar el orden de los elementos del layout para evitar que el modelo dependa de un orden artificial. Quedó como pendiente de implementar.
+El Transformer veía primero todas las categorías, luego todas las posiciones `x`, etc. Podía aprender relaciones entre categorías de distintos elementos, pero nunca entre la categoría y la geometría del **mismo** elemento.
+
+El paper espera una secuencia **intercalada por elemento**:
+
+```text
+[c1, x1, y1, w1, h1, c2, x2, y2, w2, h2, ...]
+```
+
+Así el Transformer entiende que esos 5 tokens pertenecen al mismo elemento y puede modelar coherencia interna (por ejemplo, que un `Button` tenga un cierto rango de anchos y altura).
+
+**La corrección** ajustó la lógica del `forward()` a:
+
+1. embeddings por modalidad: `[B, M, D] × 5`
+2. stack: `[B, M, 5, D]`
+3. reshape intercalado: `[B, 5M, D]`
+4. Transformer sobre la secuencia completa
+5. reshape de vuelta: `[B, M, 5, D]`
+6. heads por modalidad
+
+Esta fue una corrección estructural fuerte y necesaria.
+
+## 8.5. Shuffle de elementos — validado como correcto
+
+El paper requiere mezclar el orden de los elementos del layout para evitar que el modelo dependa de un orden artificial.
+
+Se comprobó que el shuffle implementado:
+
+* solo mezclaba los elementos reales (nunca PAD),
+* mantenía el padding compacto al final,
+* no cambiaba el número de elementos válidos,
+* no alteraba el contenido de los tokens.
+
+**Resultado**: shuffle correcto — descartado como causa de degeneración.
 
 ## 8.6. Errores en la indexación temporal de `Q_t`
 
@@ -364,35 +398,100 @@ Se renderizaron varios samples y todos repetían el mismo patrón. Eso confirmó
 
 Al corregir el flatten intercalado, el resultado mejoró ligeramente — pero no fue suficiente por sí solo.
 
+## 9.4. Prueba con `M` reducido
+
+Se probó bajar `M` de `55` a `25`. Los layouts generados mejoraron ligeramente, lo que confirmó que el exceso de padding contribuía al problema. Reducir `M` no fue la solución definitiva, pero simplificó el espacio de error y facilitó observar el efecto de cada corrección posterior.
+
 ---
 
 # 10. Diagnóstico actual del proyecto
 
-## 10.1. Qué ya se puede afirmar
+Esta sección documenta tanto las correcciones estructurales realizadas después de la primera generación como el estado actual del sistema.
+
+## 10.1. Reducción de `M` a 25
+
+Como primera medida exploratoria se redujo `M` de `55` (p95 real del dataset) a `25`. Los layouts generados mejoraron ligeramente — lo que confirmó que el exceso de padding contribuía al problema sin ser la causa principal.
+
+## 10.2. Corrección del flatten intercalado — efecto observado
+
+Después de aplicar la corrección del flatten (sección 8.4):
+
+* desaparecieron algunos patrones repetitivos artificiales,
+* mejoró la coherencia entre categoría y geometría del mismo elemento,
+* pero la degeneración general del layout persistió.
+
+Conclusión: el flatten era necesario pero no suficiente por sí solo.
+
+## 10.3. Shuffle de elementos — validado como correcto
+
+Se comprobó punto a punto que el shuffle durante el entrenamiento:
+
+* mezclaba solo elementos reales (nunca PAD),
+* mantenía el padding compacto al final,
+* no alteraba el contenido ni el número de elementos válidos.
+
+**Resultado**: shuffle correcto — descartado como causa de degeneración.
+
+## 10.4. Schedule forward exacto — implementado y validado
+
+Se reemplazó el schedule placeholder por una versión exacta tipo **mask-and-replace** coherente con VQ-Diffusion/LayoutDM:
+
+* `alpha_t`: probabilidad de conservar el token original
+* `beta_t`: probabilidad de reemplazar por una clase normal aleatoria
+* `gamma_t`: probabilidad de enmascarar con `[MASK]`
+
+Se construyeron matrices `Q_t` válidas por modalidad y se validaron inspeccionando su comportamiento:
+
+| Timestep | `alpha_t` | `gamma_t` | filas de `Q_t` |
+|---|---|---|---|
+| `t` pequeño | alto | bajo | suman 1 ✅ |
+| `t` medio | medio | medio | suman 1 ✅ |
+| `t = T` | bajo | alto | suman 1 ✅ |
+
+**Resultado**: schedule matemáticamente consistente con el paper.
+
+## 10.5. Estado después de estas correcciones
+
+Con esto quedan validadas las capas de representación y corrupción:
+
+* flatten intercalado ✅
+* shuffle de elementos ✅
+* schedule forward exacto ✅
+* `M` reducido para depuración ✅
+
+El problema residual ya no apunta a la estructura de datos ni al proceso forward. El sospechoso principal pasa a ser el **reverse sampling**.
+
+## 10.6. Qué ya se puede afirmar
 
 * el dataset real sí está conectado al modelo ✅
 * el entrenamiento ya corre con artefactos reales ✅
 * el modelo sí aprende algo ✅
 * el rendering de samples generados funciona ✅
-* el flatten intercalado mejora el comportamiento ✅
+* flatten intercalado corregido ✅
+* shuffle de elementos validado ✅
+* schedule forward exacto implementado ✅
 
-## 10.2. Sospechosos actuales de la baja calidad
+## 10.7. Sospechosos actuales de la baja calidad
 
-### a. Schedule del paper no exacto
+### a. Reverse sampling posiblemente mal calibrado
 
-La implementación sigue usando una versión aproximada del schedule de transición discreta.
+Es ahora el sospechoso más fuerte. Muchos blueprints simplificados fallan aquí porque:
 
-### b. Sampling reverso posiblemente mal calibrado
+* usan una aproximación ingenua del posterior `q(z_{t-1} | z_t, z_0)`,
+* no reconstruyen bien `z_{t-1}` paso a paso,
+* o tratan incorrectamente `PAD` y `MASK` durante el sampling.
 
-Aunque el entrenamiento corre, el bloque de sampling puede seguir incorrecto o incompleto.
+### b. `q_sample()` no validado en la práctica
 
-### c. `M=55` puede estar sobrecargando los layouts
+Aunque el schedule es matemáticamente correcto, no se ha comprobado visualmente que una muestra real se degrade de forma esperada (casi intacta para `t` pequeño, casi toda en `MASK` para `t = T`).
 
-Un valor alto de `M` deja demasiado espacio para generar layouts saturados.
-
-### d. RICO sin filtrado estructural mete ruido
+### c. RICO sin filtrado estructural mete ruido
 
 Tomar todos los elementos sin filtrado mínimo puede empeorar la calidad estructural del dataset de entrenamiento.
+
+### d. Entrenamiento todavía insuficiente
+
+Con todas las correcciones activas, puede que simplemente falten epochs para que el modelo converja.
 
 ---
 
@@ -553,20 +652,50 @@ Si renderizas `tokens_val.pt` reales y los layouts se ven plausibles, el preproc
 
 # 14. Explicación separada: Entrenamiento del modelo
 
+## Arquitectura del denoiser
+
+### 1. Embeddings por modalidad
+
+Cada token discreto se convierte en embedding: `c_embed`, `x_embed`, `y_embed`, `w_embed`, `h_embed`, produciendo tensores `[B, M, D]` por modalidad.
+
+### 2. Positional encodings desacoplados
+
+Se usan dos tipos de embeddings posicionales:
+
+* **posición de elemento**: qué elemento es dentro del layout
+* **posición de atributo**: qué modalidad es dentro del elemento
+
+Esto permite que el Transformer represente mejor la estructura bidimensional `(elemento, atributo)`.
+
+### 3. Flatten intercalado
+
+Los embeddings se reorganizan en secuencia intercalada `[B, 5M, D]` antes de entrar al Transformer. Ver sección 8.4 para detalle.
+
+### 4. Transformer encoder
+
+Procesa la secuencia completa sin autoregresión. LayoutDM modela el layout completo de forma paralela.
+
+### 5. Heads por modalidad
+
+Para cada modalidad hay una proyección lineal al tamaño de su vocabulario: `[B, M, V_m]`.
+
 ## Qué ya funciona
 
 * carga `tokens_*.pt` reales desde disco ✅
 * lee `vocab_meta.json` y usa `M` real ✅
 * construye `pad_mask` correcto por modalidad ✅
+* flatten intercalado por elemento ✅
+* shuffle de elementos validado ✅
+* schedule forward exacto implementado ✅
 * ejecuta entrenamiento sin errores ✅
 * guarda checkpoint ✅
 * genera muestras renderizables ✅
 
 ## Qué sigue faltando
 
-* schedule exacto del paper (reemplazar `make_transition_params()`)
+* validar `q_sample()` visualmente — comprobar degradación gradual de muestras reales
 * revisión del sampling reverso (`q_sample_from_Qbar`, `compute_losses`, `unconditional_sample`)
-* shuffle de elementos por sample en el Dataset
+* reentrenar corrida corta con todas las correcciones activas
 * mejor validación cualitativa comparando real vs generado
 
 ## Cómo se prueba el resultado
@@ -587,7 +716,7 @@ No con accuracy tradicional. Se genera y renderiza. Las preguntas clave:
 
 * parser funcional (66 195 / 66 261 pantallas)
 * manejo de archivos dañados con warning, sin crash
-* `M = 55` calculado desde datos reales (p95)
+* `M = 55` calculado desde datos reales (p95); `M = 25` para depuración
 * split reproducible (52 956 / 6 619 / 6 620)
 * vocabulario de 25 categorías desde train
 * KMeans train-only con BINS = 64
@@ -595,15 +724,17 @@ No con accuracy tradicional. Se genera y renderiza. Las preguntas clave:
 * trazabilidad `screen_id` ↔ token row resuelta
 * training loop con datos reales (sin dummy)
 * `pad_mask` correcto por modalidad
-* flatten intercalado por elemento
+* flatten intercalado por elemento ✅
+* shuffle de elementos validado como correcto ✅
+* schedule forward exacto implementado ✅
 * entrenamiento e2e funcional
 * generación y render básicos
 
 ## Pendiente para mayor fidelidad al paper
 
-* schedule exacto de transición discreta
+* validar `q_sample()` visualmente
 * auditoría completa del sampling reverso
-* shuffle por elemento en el Dataset
+* reentrenar corrida corta con todas las correcciones activas
 * validación cruzada real vs generado sobre `tokens_val.pt`
 * comparar métricas con el paper
 
@@ -613,21 +744,20 @@ No con accuracy tradicional. Se genera y renderiza. Las preguntas clave:
 
 ## Prioridad alta
 
-1. Renderizar muestras reales de `tokens_val.pt` y compararlas con las generadas
-2. Auditar el bloque completo de sampling reverso
-3. Revisar `q_sample_from_Qbar()`, `compute_losses()`, `unconditional_sample()`
+1. Validar `q_sample()` visualmente — degradar muestras reales de `tokens_val.pt` y confirmar comportamiento esperado: casi intacta para `t` pequeño, parcialmente enmascarada a `t` medio, casi toda en `MASK` para `t = T`
+2. Auditar el bloque completo de sampling reverso: `q_sample_from_Qbar()`, `compute_losses()`, `unconditional_sample()`
+3. Reentrenar una corrida corta controlada con todas las correcciones activas y comparar visualmente contra resultados anteriores
 
 ## Prioridad media
 
-4. Evaluar bajar `M` (e.g., p90 = 43)
-5. Evaluar filtrado estructural mínimo de RICO
-6. Implementar el schedule exacto del paper
+4. Evaluar filtrado estructural mínimo de RICO (eliminar elementos con categoría `UNKNOWN` o de muy baja frecuencia)
+5. Comparar layouts generados vs muestras reales de `tokens_val.pt`
+6. Ajustar `M` al valor óptimo según calidad visual observada
 
 ## Prioridad posterior
 
-7. Añadir shuffle por elemento en el Dataset
-8. Entrenar más epochs con el pipeline corregido
-9. Conectar LayoutDM con UI-Diffuser para generación visual final
+7. Entrenar más epochs con el pipeline completamente corregido
+8. Conectar LayoutDM con UI-Diffuser para generación visual final
 
 ---
 
@@ -635,14 +765,17 @@ No con accuracy tradicional. Se genera y renderiza. Las preguntas clave:
 
 El trabajo logró pasar de una implementación blueprint parcialmente dummy a un **pipeline real completo** con RICO, tokenización discreta, entrenamiento funcional y generación renderizable.
 
+Después de la primera generación se realizó una ronda de correcciones estructurales: se redujo `M` para depurar en un espacio más controlado, se corrigió el flatten intercalado del denoiser, se validó el shuffle de elementos, y se implementó el schedule forward exacto del paper.
+
 Lo más importante que aprendimos:
 
-* la compatibilidad entre preprocessing y training **no es automática** — hubo que alinear `M`, `pad_mask`, `vocab_meta`, indexación temporal, y flatten
+* el problema no era una sola línea de código sino una combinación de factores: representación de la secuencia, dinámica de corrupción, y posiblemente el sampling reverso
+* la compatibilidad entre preprocessing y training **no es automática** — hubo que alinear `M`, `pad_mask`, `vocab_meta`, indexación temporal, flatten y schedule
 * una loss que baja **no garantiza buenos layouts** — los sanity checks visuales son indispensables
 * la trazabilidad `screen_id` ↔ `token_row` es **obligatoria** para debug correcto
-* el primer resultado fue un sanity check positivo, pero la calidad sigue requiriendo ajustes en schedule, sampling y posiblemente `M`
+* antes de evaluar calidad del muestreo hay que verificar integridad estructural en toda la cadena
 
-La parte más valiosa es que ahora ya no se depura "en abstracto": hay un sistema real que entrena, genera, falla de manera observable y por eso mismo puede seguir mejorándose de forma dirigida.
+La parte más valiosa es que el sistema ahora opera con un pipeline matemáticamente más sólido. Los siguientes pasos apuntan directamente al reverse sampling, que es el último eslabón aún sin validar a fondo.
 
 ---
 
@@ -725,6 +858,8 @@ with open(os.path.join(OUT_DIR, "split_ids.json"), "w", encoding="utf-8") as f:
 | `pad_mask` con un único pad_id | Iterar sobre `["c","x","y","w","h"]` con pad_id por modalidad |
 | `M=25` fijo | Leer `M` desde `vocab_meta["M"]` |
 | Dataset dummy | Cargar `tokens_train.pt` / `tokens_val.pt` desde disco |
-| Flatten por bloques de modalidad | Flatten intercalado por elemento |
+| Flatten por bloques de modalidad | Flatten intercalado por elemento (`[B, 5M, D]`) |
 | `Qts_all[m][t]` fuera de rango | Usar `t-1` como índice; para `t==1`, `Qbar_0 = I` |
 | Argumento `mask_id` como float | Usar argumentos nombrados en llamada a `build_Qt()` |
+| Schedule placeholder no fiel al paper | Implementar mask-and-replace exacto con `alpha_t`, `beta_t`, `gamma_t` y validar filas de `Q_t` |
+| Shuffle posiblemente roto | Validado: solo mezcla elementos reales, PAD queda al final |
