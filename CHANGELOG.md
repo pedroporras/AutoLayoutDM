@@ -138,3 +138,30 @@ Nota: Esta primera iteracion presenta un problema, hay un error en el indexado e
 
 ### Eliminado
 - Código comentado residual de iter1/iter2: funciones `_infer_screen_size_from_tree`, `_bounds_to_xywh_norm`, `infer_base_wh_from_root` y bloques `# old / # legacy` dentro de `rico_semantic_json_to_elements` — el código queda limpio sin rastros de iteraciones anteriores.
+
+---
+
+## [Preprocessing iter 4 — layoutdm_preprocesamiento.py] — 2026-03-30
+
+### Añadido
+- `RICO25_LABELS`: whitelist estricta de las 25 categorías semánticas oficiales de LayoutDM/RICO (`CyberAgentAILab/layout-dm`). Solo se conservan elementos cuyo `componentLabel` esté en este conjunto; contenedores, `ViewGroup`, nodos sin etiqueta y clases desconocidas se descartan implícitamente.
+- `DISCARD_LONG_SCREENS`: flag que reproduce el comportamiento oficial del paper — las pantallas con `N > M` se descartan en lugar de truncarse. `DISCARD_LONG_SCREENS=False` mantiene el comportamiento de truncado de iteraciones anteriores.
+- `NMS_IOU_THRESHOLD` / `PREFER_LEAVES`: filtro NMS opcional para eliminar cajas casi duplicadas (IoU ≥ umbral). Prioriza nodos hoja cuando hay empate. Desactivable fijando `NMS_IOU_THRESHOLD = 1.0`.
+- `M_ROUND_BASE`: `M` ahora se redondea al múltiplo de `M_ROUND_BASE` (por defecto 5) más cercano por encima del percentil crudo.
+- `round_up_to_multiple()`: utilidad de redondeo hacia arriba a múltiplos.
+- `_is_leaf()`: helper que indica si un nodo del árbol UI no tiene hijos.
+- `_iou_2d()`: cálculo de IoU entre dos cajas 2D.
+- `_nms_filter()`: greedy NMS sobre la lista de elementos crudos; ordena por (leaf_score, -area) para priorizar nodos hoja y más pequeños.
+- `vocab_meta.json` ahora incluye:
+  - campo `"filter"` con la configuración completa de filtrado (`rico25_labels`, `nms_iou_threshold`, `prefer_leaves`, `discard_long_screens`, `drop_root`) para trazabilidad reproducible del pipeline.
+  - campos `M_raw` y `M_round_base` para documentar el valor crudo del percentil y el factor de redondeo usado.
+
+### Modificado
+- `rico_semantic_json_to_elements`: refactorizada con tres etapas de filtrado explícitas:
+  1. **Label whitelist** (filtro oficial LayoutDM) — descarta nodos cuyo `componentLabel` no está en `RICO25_LABELS`.
+  2. **`is_valid` geométrico** (filtro oficial LayoutDM) — descarta elementos parcial o totalmente fuera de los límites de pantalla, o con tamaño degenerado.
+  3. **NMS opcional** (extra, no presente en el repo oficial) — elimina cajas casi duplicadas según `NMS_IOU_THRESHOLD`.
+- `main()`:
+  - Calcula `M` dinámicamente usando `choose_M_from_counts(percentile=M_PERCENTILE)` seguido de `round_up_to_multiple()`, en lugar de usar un valor fijo.
+  - Añade paso de descarte de pantallas largas (post-cálculo de `M`) con log del número y porcentaje descartados.
+  - `M_PERCENTILE` por defecto cambiado a `50` para facilitar depuración con layouts compactos; el comentario documenta `p90/p95/p99` como alternativas.
