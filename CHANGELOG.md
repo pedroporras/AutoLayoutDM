@@ -98,3 +98,32 @@ Nota: Esta primera iteracion presenta un problema, hay un error en el indexado e
 | `M_PERCENTILE` | 95 | Percentil para elegir la longitud máxima de secuencia |
 | `DROP_ROOT` | `True` | Excluir el nodo raíz de los elementos |
 | `SEED` | 42 | Semilla global para reproducibilidad |
+
+---
+
+## [Preprocessing iter 2 — layoutdm_preprocesamiento.py] — 2026-03-30
+
+### Corregido
+- **Bug crítico: desfase de índices entre preprocesamiento y lookup de ejemplos.**  
+  En iter1, `split_ids` se llamaba con `len(json_files)` (total de ficheros JSON, incluyendo los inparsables), pero los tokens se construían solo sobre `screens` (pantallas parseables). Esto producía que el índice del token `[i]` apuntara a una pantalla distinta a la esperada.  
+  **Fix**: el split ahora se calcula sobre `len(screens)` (solo las pantallas parseables); la lista `good_ids` captura exactamente los IDs que entraron en los tensores.
+
+- **Bug: `infer_base_wh_from_root` calculaba `base_w = x0 + x1` en lugar de `base_w = x1 - x0`.**  
+  La heurística original sumaba las coordenadas en lugar de restar para obtener el ancho real.  
+  Corrección intermedia documentada en los comentarios del código; la función fue finalmente eliminada en favor del snapping a resolución canónica (ver *Modificado* abajo).
+
+### Modificado
+- `rico_semantic_json_to_elements` refactorizado con nueva estrategia de normalización:
+  - Elimina la dependencia de `infer_base_wh_from_root` y de `_infer_screen_size_from_tree`.
+  - Infiere la resolución de diseño del dispositivo haciendo **snapping al candidato estándar de RICO más cercano** (`720×1280`, `1080×1920`, `1440×2560`) usando `sum_w = x0 + x1`, `sum_h = y0 + y1` como estimadores.
+  - Normalización directa por `design_w` / `design_h` en coordenadas absolutas, consistente con el enfoque "línea amarilla" de las visualizaciones de debug.
+
+### Eliminado
+- `_infer_screen_size_from_tree`: ya no forma parte del path principal (comentada en el código).
+- `_bounds_to_xywh_norm`: reemplazada por la normalización inline en `rico_semantic_json_to_elements`.
+- `infer_base_wh_from_root`: sustituida por el snapping a resoluciones canónicas.
+
+### Añadido
+- Patrón de validación `good_ids` / `bad_ids`: antes de hacer el split, se construye la lista de IDs parseables para garantizar coherencia entre índices de tokens y pantallas reales.
+- `can_infer_screen_size`: helper de validación para verificar si una pantalla tiene bounds usables antes de incluirla.
+- Workflow de debug mejorado: usa `screens = load_all_screens(SEM_DIR)` + `screen_ids = [s["id"] for s in screens]` para mapear correctamente fila de token → ID de pantalla en las celdas de inspección visual.
