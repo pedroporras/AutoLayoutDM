@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LayoutDM (preprocesamiento iter1).ipynb
+"""LayoutDM (preprocesamiento iter2).ipynb
 
 """
 
@@ -100,82 +100,102 @@ def _normalize_bounds(b: List[float]) -> Optional[Tuple[float, float, float, flo
         return None
     return x0, y0, x1, y1
 
-def _infer_screen_size_from_tree(data: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
-    """
-    Infer (sx0, sy0, sx1, sy1) as the global bbox over all nodes with valid bounds.
-    This rescues files where root bounds are invalid/missing.
-    """
-    nodes = _walk_nodes(data)
-    mins = [float("inf"), float("inf")]
-    maxs = [float("-inf"), float("-inf")]
-    found = False
+# def _infer_screen_size_from_tree(data: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+#     """
+#     Infer (sx0, sy0, sx1, sy1) as the global bbox over all nodes with valid bounds.
+#     This rescues files where root bounds are invalid/missing.
+#     """
+#     nodes = _walk_nodes(data)
+#     mins = [float("inf"), float("inf")]
+#     maxs = [float("-inf"), float("-inf")]
+#     found = False
 
-    for n in nodes:
-        b = n.get("bounds")
-        if not isinstance(b, list):
-            continue
-        nb = _normalize_bounds(b)
-        if nb is None:
-            continue
-        x0, y0, x1, y1 = nb
-        mins[0] = min(mins[0], x0)
-        mins[1] = min(mins[1], y0)
-        maxs[0] = max(maxs[0], x1)
-        maxs[1] = max(maxs[1], y1)
-        found = True
+#     for n in nodes:
+#         b = n.get("bounds")
+#         if not isinstance(b, list):
+#             continue
+#         nb = _normalize_bounds(b)
+#         if nb is None:
+#             continue
+#         x0, y0, x1, y1 = nb
+#         mins[0] = min(mins[0], x0)
+#         mins[1] = min(mins[1], y0)
+#         maxs[0] = max(maxs[0], x1)
+#         maxs[1] = max(maxs[1], y1)
+#         found = True
 
-    if not found:
-        return None
+#     if not found:
+#         return None
 
-    sx0, sy0, sx1, sy1 = mins[0], mins[1], maxs[0], maxs[1]
-    if (sx1 - sx0) <= 0 or (sy1 - sy0) <= 0:
-        return None
-    return sx0, sy0, sx1, sy1
+#     sx0, sy0, sx1, sy1 = mins[0], mins[1], maxs[0], maxs[1]
+#     if (sx1 - sx0) <= 0 or (sy1 - sy0) <= 0:
+#         return None
+#     return sx0, sy0, sx1, sy1
 
-def _bounds_to_xywh_norm(bounds: List[float], screen_w: float, screen_h: float) -> Optional[Tuple[float, float, float, float]]:
-    nb = _normalize_bounds(bounds)
-    if nb is None:
-        return None
-    x0, y0, x1, y1 = nb
+# def _bounds_to_xywh_norm(bounds: List[float], screen_w: float, screen_h: float) -> Optional[Tuple[float, float, float, float]]:
+#     nb = _normalize_bounds(bounds)
+#     if nb is None:
+#         return None
+#     x0, y0, x1, y1 = nb
 
-    w_px = x1 - x0
-    h_px = y1 - y0
-    if screen_w <= 0 or screen_h <= 0:
-        return None
-    if w_px <= 0 or h_px <= 0:
-        return None
+#     w_px = x1 - x0
+#     h_px = y1 - y0
+#     if screen_w <= 0 or screen_h <= 0:
+#         return None
+#     if w_px <= 0 or h_px <= 0:
+#         return None
 
-    x_c = (x0 + x1) / 2.0
-    y_c = (y0 + y1) / 2.0
+#     x_c = (x0 + x1) / 2.0
+#     y_c = (y0 + y1) / 2.0
 
-    x = x_c / screen_w
-    y = y_c / screen_h
-    w = w_px / screen_w
-    h = h_px / screen_h
+#     x = x_c / screen_w
+#     y = y_c / screen_h
+#     w = w_px / screen_w
+#     h = h_px / screen_h
 
-    # clamp defensive
-    x = max(0.0, min(1.0, x))
-    y = max(0.0, min(1.0, y))
-    w = max(0.0, min(1.0, w))
-    h = max(0.0, min(1.0, h))
+#     # clamp defensive
+#     x = max(0.0, min(1.0, x))
+#     y = max(0.0, min(1.0, y))
+#     w = max(0.0, min(1.0, w))
+#     h = max(0.0, min(1.0, h))
 
-    return x, y, w, h
+#     return x, y, w, h
 
-def infer_base_wh_from_root(bounds):
-    """
-    Heurística simple y efectiva para RICO:
-    si root es un sub-rectángulo del full screen, entonces
-    full_w ~= x0 + x1, full_h ~= y0 + y1
-    """
-    nb = _normalize_bounds(bounds)
-    if nb is None:
-        return None
-    x0, y0, x1, y1 = nb
-    base_w = x0 + x1
-    base_h = y0 + y1
-    if base_w <= 0 or base_h <= 0:
-        return None
-    return float(base_w), float(base_h)
+# def infer_base_wh_from_root(bounds):
+#     """
+#     Heurística simple y efectiva para RICO:
+#     si root es un sub-rectángulo del full screen, entonces
+#     full_w ~= x0 + x1, full_h ~= y0 + y1
+#     """
+#     # nb = _normalize_bounds(bounds)
+#     # if nb is None:
+#     #     return None
+#     # x0, y0, x1, y1 = nb
+#     # base_w = x0 + x1
+#     # base_h = y0 + y1
+#     # if base_w <= 0 or base_h <= 0:
+#     #     return None
+#     # return float(base_w), float(base_h)
+
+#     # nb = _normalize_bounds(bounds)
+#     # if nb is None:
+#     #     return None
+#     # x0, y0, x1, y1 = nb
+#     # base_w = x1 - x0  # ✅ Correct: width = x1 - x0
+#     # base_h = y1 - y0  # ✅ Correct: height = y1 - y0
+#     # if base_w <= 0 or base_h <= 0:
+#     #     return None
+#     # return float(base_w), float(base_h)
+#     nb = _normalize_bounds(bounds)
+#     if nb is None:
+#         return None
+#     x0, y0, x1, y1 = nb
+#     base_w = x1 - x0  # ✅ Correct: width = right - left
+#     base_h = y1 - y0  # ✅ Correct: height = bottom - top
+#     if base_w <= 0 or base_h <= 0:
+#         return None
+#     return float(base_w), float(base_h)
+
 
 def rico_semantic_json_to_elements(data: Dict[str, Any]) -> Tuple[Tuple[float, float], List[Dict[str, Any]]]:
     """
@@ -187,18 +207,19 @@ def rico_semantic_json_to_elements(data: Dict[str, Any]) -> Tuple[Tuple[float, f
     if not isinstance(root_bounds, list):
         raise ValueError("Root has no bounds")
 
-    # ✅ base_w/base_h para normalización (full screen coords)
-    base = infer_base_wh_from_root(root_bounds)
-    if base is None:
-        # fallback: infer from tree bbox (menos ideal pero funciona)
-        screen_bbox = _infer_screen_size_from_tree(data)
-        if screen_bbox is None:
-            raise ValueError("Cannot infer screen size: no valid bounds in tree.")
-        sx0, sy0, sx1, sy1 = screen_bbox
-        base_w = float(sx1 - sx0)
-        base_h = float(sy1 - sy0)
-    else:
-        base_w, base_h = base
+    rb = _normalize_bounds(root_bounds)
+    if rb is None:
+        raise ValueError("Cannot normalize root bounds")
+
+    x0, y0, x1, y1 = rb
+
+    # For RICO, infer the design resolution
+    sum_w = x0 + x1
+    sum_h = y0 + y1
+
+    # Common RICO design resolutions
+    candidates = [(720, 1280), (1080, 1920), (1440, 2560)]
+    design_w, design_h = min(candidates, key=lambda wh: abs(wh[0] - sum_w) + abs(wh[1] - sum_h))
 
     nodes = _walk_nodes(data)
     if DROP_ROOT and nodes:
@@ -212,23 +233,24 @@ def rico_semantic_json_to_elements(data: Dict[str, Any]) -> Tuple[Tuple[float, f
         nb = _normalize_bounds(b)
         if nb is None:
             continue
-        x0, y0, x1, y1 = nb
+        nx0, ny0, nx1, ny1 = nb
 
-        w_px = x1 - x0
-        h_px = y1 - y0
+        w_px = nx1 - nx0
+        h_px = ny1 - ny0
         if w_px <= 0 or h_px <= 0:
             continue
 
-        x_c = (x0 + x1) / 2.0
-        y_c = (y0 + y1) / 2.0
+        # Use absolute coordinates directly, normalized by design resolution
+        x_c = (nx0 + nx1) / 2.0
+        y_c = (ny0 + ny1) / 2.0
 
-        # ✅ NORMALIZACIÓN CORRECTA A FULL SCREEN
-        x = x_c / base_w
-        y = y_c / base_h
-        w = w_px / base_w
-        h = h_px / base_h
+        # Normalize by design resolution (this matches the yellow line approach)
+        x = x_c / design_w
+        y = y_c / design_h
+        w = w_px / design_w
+        h = h_px / design_h
 
-        # clamp defensivo
+        # Clamp to reasonable range
         x = max(0.0, min(1.0, x))
         y = max(0.0, min(1.0, y))
         w = max(0.0, min(1.0, w))
@@ -237,7 +259,119 @@ def rico_semantic_json_to_elements(data: Dict[str, Any]) -> Tuple[Tuple[float, f
         category = n.get("componentLabel") or n.get("class") or "UNKNOWN"
         elements.append({"category": str(category), "x": x, "y": y, "w": w, "h": h})
 
-    return (base_w, base_h), elements
+    return (design_w, design_h), elements
+    # root_bounds = data.get("bounds")
+    # if not isinstance(root_bounds, list):
+    #     raise ValueError("Root has no bounds")
+
+    # # Try to get screen dimensions from root bounds
+    # base = infer_base_wh_from_root(root_bounds)
+    # if base is None:
+    #     # fallback: infer from tree bbox
+    #     screen_bbox = _infer_screen_size_from_tree(data)
+    #     if screen_bbox is None:
+    #         raise ValueError("Cannot infer screen size: no valid bounds in tree.")
+    #     sx0, sy0, sx1, sy1 = screen_bbox
+    #     base_w = float(sx1 - sx0)
+    #     base_h = float(sy1 - sy0)
+    # else:
+    #     base_w, base_h = base
+
+    # nodes = _walk_nodes(data)
+    # if DROP_ROOT and nodes:
+    #     nodes = nodes[1:]
+
+    # elements = []
+    # for n in nodes:
+    #     b = n.get("bounds")
+    #     if not isinstance(b, list):
+    #         continue
+    #     nb = _normalize_bounds(b)
+    #     if nb is None:
+    #         continue
+    #     x0, y0, x1, y1 = nb
+
+    #     w_px = x1 - x0
+    #     h_px = y1 - y0
+    #     if w_px <= 0 or h_px <= 0:
+    #         continue
+
+    #     x_c = (x0 + x1) / 2.0
+    #     y_c = (y0 + y1) / 2.0
+
+    #     # ✅ CORRECT NORMALIZATION
+    #     x = x_c / base_w
+    #     y = y_c / base_h
+    #     w = w_px / base_w
+    #     h = h_px / base_h
+
+    #     # clamp defensive
+    #     x = max(0.0, min(1.0, x))
+    #     y = max(0.0, min(1.0, y))
+    #     w = max(0.0, min(1.0, w))
+    #     h = max(0.0, min(1.0, h))
+
+    #     category = n.get("componentLabel") or n.get("class") or "UNKNOWN"
+    #     elements.append({"category": str(category), "x": x, "y": y, "w": w, "h": h})
+
+    # return (base_w, base_h), elements
+
+    # root_bounds = data.get("bounds")
+    # if not isinstance(root_bounds, list):
+    #     raise ValueError("Root has no bounds")
+
+    # # ✅ base_w/base_h para normalización (full screen coords)
+    # base = infer_base_wh_from_root(root_bounds)
+    # if base is None:
+    #     # fallback: infer from tree bbox (menos ideal pero funciona)
+    #     screen_bbox = _infer_screen_size_from_tree(data)
+    #     if screen_bbox is None:
+    #         raise ValueError("Cannot infer screen size: no valid bounds in tree.")
+    #     sx0, sy0, sx1, sy1 = screen_bbox
+    #     base_w = float(sx1 - sx0)
+    #     base_h = float(sy1 - sy0)
+    # else:
+    #     base_w, base_h = base
+
+    # nodes = _walk_nodes(data)
+    # if DROP_ROOT and nodes:
+    #     nodes = nodes[1:]
+
+    # elements = []
+    # for n in nodes:
+    #     b = n.get("bounds")
+    #     if not isinstance(b, list):
+    #         continue
+    #     nb = _normalize_bounds(b)
+    #     if nb is None:
+    #         continue
+    #     x0, y0, x1, y1 = nb
+
+    #     w_px = x1 - x0
+    #     h_px = y1 - y0
+    #     if w_px <= 0 or h_px <= 0:
+    #         continue
+
+    #     x_c = (x0 + x1) / 2.0
+    #     y_c = (y0 + y1) / 2.0
+
+    #     # ✅ NORMALIZACIÓN CORRECTA A FULL SCREEN
+    #     x = x_c / base_w
+    #     y = y_c / base_h
+    #     w = w_px / base_w
+    #     h = h_px / base_h
+
+    #     # clamp defensivo
+    #     x = max(0.0, min(1.0, x))
+    #     y = max(0.0, min(1.0, y))
+    #     w = max(0.0, min(1.0, w))
+    #     h = max(0.0, min(1.0, h))
+
+    #     category = n.get("componentLabel") or n.get("class") or "UNKNOWN"
+    #     elements.append({"category": str(category), "x": x, "y": y, "w": w, "h": h})
+
+    # return (base_w, base_h), elements
+
     # root_bounds = data.get("bounds")
     # screen_bbox = None
 
@@ -550,6 +684,8 @@ def sanity_check_decoded(train_tokens, centroids, vocab_meta, n=10):
                 ok += 1
         print("sample", i, "boxes", len(boxes), "inside", ok)
 
+
+
 # -----------------------------
 # Main pipeline
 # -----------------------------
@@ -856,7 +992,8 @@ def draw_boxes_on_image(img: Image.Image, boxes, draw_labels=False):
         y1 = max(0, min(H-1, y1))
 
         # draw rectangle (default stroke color)
-        draw.rectangle([x0, y0, x1, y1], width=2)
+        # draw.rectangle([x0, y0, x1, y1], width=2)
+        draw.rectangle([x0, y0, x1, y1], outline=(0, 255, 255), width=9)
 
         if draw_labels:
             c_id = b["c_id"]
@@ -902,7 +1039,8 @@ def make_grid(images, cols=6, pad=8, bg=(255,255,255)):
 # Render K samples
 # -----------------------
 random.seed(SEED)
-choices = random.sample(range(len(train_ids)), k=min(K, len(train_ids)))
+# choices = random.sample(range(len(train_ids)), k=min(K, len(train_ids)))
+choices = (29887,39091,44911,46081)
 
 rendered = []
 skipped = 0
@@ -939,6 +1077,215 @@ if grid is not None:
 
 # If you're in Colab, show the grid
 grid
+
+for index, x in enumerate(train_ids):
+  if x in ('0', '1','2','3','4'):
+    print(index)
+
+OVERLAY_OUT
+
+boxes = decode_row_to_boxes(tokens_train[29742])
+img = Image.open(find_image_for_id(train_ids[29887])).convert("RGB")
+overlay = img.copy()
+draw_boxes_on_image(overlay, boxes, draw_labels=DRAW_LABELS)
+out_path = os.path.join(OVERLAY_OUT, f"debug_{screen_id}_overlay.png")
+overlay.save(out_path)
+
+
+
+import os, json, random
+import numpy as np
+import torch
+
+OUT_DIR = "/content/layoutdm_rico_tokens"
+SEM_DIR = "/content/semantic_annotations/semantic_annotations"
+
+DEBUG_SCREEN_ID = "0"  # <-- pon aquí el id real del json (ej "00000" o "12345")
+# Si tus json se llaman "0.json" como el ejemplo, déjalo como "0"
+
+# --- load artifacts ---
+tokens_train = torch.load(os.path.join(OUT_DIR, "tokens_train.pt")).cpu()
+centroids = {
+    "x": torch.load(os.path.join(OUT_DIR, "centroids_x.pt")).cpu().numpy(),
+    "y": torch.load(os.path.join(OUT_DIR, "centroids_y.pt")).cpu().numpy(),
+    "w": torch.load(os.path.join(OUT_DIR, "centroids_w.pt")).cpu().numpy(),
+    "h": torch.load(os.path.join(OUT_DIR, "centroids_h.pt")).cpu().numpy(),
+}
+with open(os.path.join(OUT_DIR, "vocab_meta.json"), "r", encoding="utf-8") as f:
+    vocab_meta = json.load(f)
+
+pad_c = vocab_meta["c"]["pad_id"]
+pad_b = vocab_meta["x"]["pad_id"]
+
+def split_ids(n: int, seed: int, train_ratio: float, val_ratio: float, test_ratio: float):
+    idxs = list(range(n))
+    rnd = random.Random(seed)
+    rnd.shuffle(idxs)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+    train_idx = idxs[:n_train]
+    val_idx = idxs[n_train:n_train + n_val]
+    test_idx = idxs[n_train + n_val:]
+    return train_idx, val_idx, test_idx
+
+def decode_row_to_boxes(tokens_row):
+    boxes = []
+    for t in tokens_row.tolist():
+        c_id, x_id, y_id, w_id, h_id = t
+        if c_id == pad_c:
+            continue
+        if x_id == pad_b or y_id == pad_b or w_id == pad_b or h_id == pad_b:
+            continue
+        boxes.append({
+            "c_id": int(c_id),
+            "x": float(centroids["x"][x_id]),
+            "y": float(centroids["y"][y_id]),
+            "w": float(centroids["w"][w_id]),
+            "h": float(centroids["h"][h_id]),
+            "x_id": int(x_id), "y_id": int(y_id), "w_id": int(w_id), "h_id": int(h_id),
+        })
+    return boxes
+
+# --- load JSON and compute REAL expected boxes ---
+json_path = os.path.join(SEM_DIR, f"{DEBUG_SCREEN_ID}.json")
+with open(json_path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+root = data.get("bounds")
+sx0, sy0, sx1, sy1 = root
+screen_w = float(sx1 - sx0)
+screen_h = float(sy1 - sy0)
+
+def walk(n):
+    out = [n]
+    for c in (n.get("children") or []):
+        if isinstance(c, dict):
+            out.extend(walk(c))
+    return out
+
+nodes = walk(data)[1:]  # drop root
+real = []
+for n in nodes:
+    b = n.get("bounds")
+    if not (isinstance(b, list) and len(b) == 4):
+        continue
+    x0, y0, x1, y1 = map(float, b)
+    w_px, h_px = (x1-x0), (y1-y0)
+    if w_px <= 0 or h_px <= 0:
+        continue
+    x = ((x0+x1)/2) / screen_w
+    y = ((y0+y1)/2) / screen_h
+    w = w_px / screen_w
+    h = h_px / screen_h
+    real.append({"x": x, "y": y, "w": w, "h": h, "class": n.get("class"), "label": n.get("componentLabel")})
+
+print("\nREAL elements from JSON:")
+for r in real[:10]:
+    print(r)
+print("real_count:", len(real))
+
+# --- find this screen in train split and fetch token row ---
+json_files = sorted([f for f in os.listdir(SEM_DIR) if f.lower().endswith(".json")])
+target_file = f"{DEBUG_SCREEN_ID}.json"
+assert target_file in json_files, f"Not found: {target_file}"
+
+idx_in_all = json_files.index(target_file)
+train_idx, val_idx, test_idx = split_ids(
+    len(json_files),
+    seed=vocab_meta["seed"],
+    train_ratio=vocab_meta["split"]["train"],
+    val_ratio=vocab_meta["split"]["val"],
+    test_ratio=vocab_meta["split"]["test"],
+)
+
+split_name = "train" if idx_in_all in train_idx else ("val" if idx_in_all in val_idx else "test")
+print("\nSplit:", split_name)
+
+if split_name != "train":
+    print("⚠️ Tu screen no está en train, ajusta para cargar tokens_val.pt o tokens_test.pt")
+else:
+    pos = train_idx.index(idx_in_all)
+    tokens_row = tokens_train[pos]
+    decoded = decode_row_to_boxes(tokens_row)
+
+    print("\nDECODED boxes from tokens row (first 10):")
+    for b in decoded[:10]:
+        print(b)
+
+    print("decoded_count:", len(decoded))
+
+    # Compare expected vs decoded for the FIRST real element (if exists)
+    if real:
+        r0 = real[0]
+        print("\nEXPECTED (from JSON) first element:", r0)
+
+import os, json, random
+import torch
+import numpy as np
+
+OUT_DIR = "/content/layoutdm_rico_tokens"
+SEM_DIR = "/content/semantic_annotations/semantic_annotations"
+DEBUG_SCREEN_ID = "1"  # tu caso
+
+# 1) Carga screens en el MISMO orden y con el MISMO criterio de parseo del builder
+#    (usa tu load_all_screens robusto que ya imprime el WARN)
+screens = load_all_screens(SEM_DIR)  # <- esto devuelve solo los parseables, en orden por filename
+print("parsed screens:", len(screens))
+
+# 2) Encuentra el índice REAL dentro de screens (no dentro de json_files)
+screen_ids = [s["id"] for s in screens]
+assert DEBUG_SCREEN_ID in screen_ids, "Este screen_id no quedó en screens parseados"
+idx_in_screens = screen_ids.index(DEBUG_SCREEN_ID)
+print("idx_in_screens:", idx_in_screens)
+
+# 3) Reproduce split como el builder (n = len(screens))
+with open(os.path.join(OUT_DIR, "vocab_meta.json"), "r", encoding="utf-8") as f:
+    vocab_meta = json.load(f)
+
+def split_ids(n: int, seed: int, train_ratio: float, val_ratio: float, test_ratio: float):
+    idxs = list(range(n))
+    rnd = random.Random(seed)
+    rnd.shuffle(idxs)
+    n_train = int(n * train_ratio)
+    n_val = int(n * val_ratio)
+    train_idx = idxs[:n_train]
+    val_idx = idxs[n_train:n_train + n_val]
+    test_idx = idxs[n_train + n_val:]
+    return train_idx, val_idx, test_idx
+
+train_idx, val_idx, test_idx = split_ids(
+    len(screens),
+    seed=vocab_meta["seed"],
+    train_ratio=vocab_meta["split"]["train"],
+    val_ratio=vocab_meta["split"]["val"],
+    test_ratio=vocab_meta["split"]["test"],
+)
+
+split_name = "train" if idx_in_screens in train_idx else ("val" if idx_in_screens in val_idx else "test")
+print("split_name:", split_name)
+
+# 4) Carga tokens del split correcto y saca el row correcto
+if split_name == "train":
+    tokens = torch.load(os.path.join(OUT_DIR, "tokens_train.pt")).cpu()
+    pos = train_idx.index(idx_in_screens)
+elif split_name == "val":
+    tokens = torch.load(os.path.join(OUT_DIR, "tokens_val.pt")).cpu()
+    pos = val_idx.index(idx_in_screens)
+else:
+    tokens = torch.load(os.path.join(OUT_DIR, "tokens_test.pt")).cpu()
+    pos = test_idx.index(idx_in_screens)
+
+print("pos_in_split_tokens:", pos)
+tokens_row = tokens[pos]
+print("tokens_row first 10:", tokens_row[:10])
+
+pad_c = vocab_meta["c"]["pad_id"]
+real_n = int((tokens_row[:,0] != pad_c).sum().item())
+print("real_n (non-pad elems) =", real_n)
+
+
+
+
 
 import os, json, random
 import torch
@@ -1209,6 +1556,33 @@ plt.axis("off")
 plt.title(f"ID={DEBUG_SCREEN_ID}  red=real  green=decoded")
 plt.show()
 
+with open("/content/semantic_annotations/semantic_annotations/2.json", "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+# Add this to your debug section to compare normalizations
+def debug_normalization_comparison(screen_id):
+    with open(os.path.join(SEM_DIR, f"{screen_id}.json"), "r") as f:
+        data = json.load(f)
+
+    root_bounds = data.get("bounds")
+    rb = _normalize_bounds(root_bounds)
+
+    # Old method (wrong)
+    old_base_w = rb[0] + rb[2]  # x0 + x1
+    old_base_h = rb[1] + rb[3]  # y0 + y1
+
+    # New method (correct)
+    new_base_w = rb[2] - rb[0]  # x1 - x0
+    new_base_h = rb[3] - rb[1]  # y1 - y0
+
+    print(f"Screen {screen_id}:")
+    print(f"  Root bounds: {rb}")
+    print(f"  Old base_w/h: {old_base_w:.1f} x {old_base_h:.1f}")
+    print(f"  New base_w/h: {new_base_w:.1f} x {new_base_h:.1f}")
+    print(f"  Ratio difference: {old_base_w/new_base_w:.2f}x, {old_base_h/new_base_h:.2f}x")
+
+debug_normalization_comparison(DEBUG_SCREEN_ID)
+
 import os, json
 from PIL import Image
 
@@ -1368,4 +1742,26 @@ plt.imshow(overlay)
 plt.axis("off")
 plt.title("yellow=ABS->scaled (correct if image is resized) | red=old | blue=offset-to-root")
 plt.show()
+
+# files = sorted([f for f in os.listdir(RICO_SEMANTIC_DIR) if f.lower().endswith(".json")])
+# for index, fname in enumerate(files):
+#     path = os.path.join(RICO_SEMANTIC_DIR, fname)
+#     with open(path, "r", encoding="utf-8") as f:
+#         data = json.load(f)
+#     root_bounds = data.get("bounds")
+#     x0, y0, a, c = map(float, root_bounds)
+#     x1, y1 = a, c
+#     w = x1 - x0
+#     h = y1 - y0
+#     if w <= 0 or h <= 0:
+#       print("Caso atipico: ", index, root_bounds, fname)
+
+path = os.path.join(RICO_SEMANTIC_DIR, "0.json")
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+rico_semantic_json_to_elements(data)
+
+
+
+
 
