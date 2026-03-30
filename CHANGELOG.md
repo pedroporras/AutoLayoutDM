@@ -127,3 +127,14 @@ Nota: Esta primera iteracion presenta un problema, hay un error en el indexado e
 - Patrón de validación `good_ids` / `bad_ids`: antes de hacer el split, se construye la lista de IDs parseables para garantizar coherencia entre índices de tokens y pantallas reales.
 - `can_infer_screen_size`: helper de validación para verificar si una pantalla tiene bounds usables antes de incluirla.
 - Workflow de debug mejorado: usa `screens = load_all_screens(SEM_DIR)` + `screen_ids = [s["id"] for s in screens]` para mapear correctamente fila de token → ID de pantalla en las celdas de inspección visual.
+
+---
+
+## [Preprocessing iter 3 — layoutdm_preprocesamiento.py] — 2026-03-30
+
+### Añadido
+- `main()`: exporta `split_ids.json` con los IDs reales de pantalla por split (train / val / test), para garantizar trazabilidad exacta entre `tokens_train[i]` y el JSON de origen.
+- `render_debug_overlays()`: renderiza `K` pantallas con bboxes decodificadas dibujadas sobre los screenshots originales; lee `split_ids.json` en lugar de reconstruir el split desde `os.listdir()`, evitando el desfase de índices del iter1.
+
+### Eliminado
+- Código comentado residual de iter1/iter2: funciones `_infer_screen_size_from_tree`, `_bounds_to_xywh_norm`, `infer_base_wh_from_root` y bloques `# old / # legacy` dentro de `rico_semantic_json_to_elements` — el código queda limpio sin rastros de iteraciones anteriores.
