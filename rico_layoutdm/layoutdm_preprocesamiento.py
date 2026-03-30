@@ -40,18 +40,41 @@ OUT_DIR = "/content/layoutdm_rico_tokens"                # output folder
 SEED = 42
 
 # Default bins for x/y/w/h (KMeans clusters)
-BINS = 64  # Reasonable default as explained above.
+BINS = 64
 
 # Split ratios
 TRAIN_RATIO = 0.80
 VAL_RATIO = 0.10
 TEST_RATIO = 0.10
 
-# Percentile used to choose M
-M_PERCENTILE = 95  # choose M as p95 of element counts
-FORCE_M = 25
-MIN_AREA = 0.0     # "take all": we keep 0.0; still we reject w<=0 or h<=0
+# Percentile used to choose M  (computed AFTER filtering, rounded up to multiple of 5)
+M_PERCENTILE = 50  # p95 is a good default; use p90 for less padding, p99 for fuller coverage
+M_ROUND_BASE = 5   # round M up to the nearest multiple of this
+
 DROP_ROOT = True   # do not include root node itself as element
+
+# ----- label whitelist (official Rico25 from CyberAgentAILab/layout-dm) -----
+# Only elements whose componentLabel is in this set are kept.
+# This implicitly drops all containers, ViewGroups, generic layouts, etc.
+RICO25_LABELS = {
+    "Text", "Image", "Icon", "Text Button", "List Item",
+    "Input", "Background Image", "Card", "Web View", "Radio Button",
+    "Drawer", "Checkbox", "Advertisement", "Modal", "Pager Indicator",
+    "Slider", "On/Off Switch", "Button Bar", "Toolbar", "Number Stepper",
+    "Multi-Tab", "Date Picker", "Map View", "Video", "Bottom Navigation",
+}  # 25 semantic UI categories
+
+# ----- screen-level length filter (official LayoutDM behavior) -----
+# If True: screens with element count > M are DISCARDED (matches the paper).
+# If False: screens are truncated to M elements (less faithful to the paper).
+DISCARD_LONG_SCREENS = True
+
+# ----- optional extra filtering -----
+# Drop near-duplicate boxes: if two boxes have IoU >= this threshold, keep only the leaf/smaller one
+# Set to 1.0 to disable NMS entirely.
+NMS_IOU_THRESHOLD = 0.85
+# If True, prefer leaf nodes (no children) when de-duplicating
+PREFER_LEAVES = True
 
 # KMeans settings
 KMEANS_N_INIT = 10
@@ -84,12 +107,10 @@ def _normalize_bounds(b: List[float]) -> Optional[Tuple[float, float, float, flo
     except Exception:
         return None
 
-    # First assume it's [x0,y0,x1,y1]
     x1, y1 = a, c
     w = x1 - x0
     h = y1 - y0
 
-    # If degenerate, try interpret as [x,y,w,h]
     if w <= 0 or h <= 0:
         w2, h2 = a, c
         if w2 > 0 and h2 > 0:
@@ -103,11 +124,73 @@ def _normalize_bounds(b: List[float]) -> Optional[Tuple[float, float, float, flo
     return x0, y0, x1, y1
 
 
+# ----- NMS helpers -----
+
+def _is_leaf(node: Dict[str, Any]) -> bool:
+    children = node.get("children") or []
+    return len(children) == 0
+
+
+def _iou_2d(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1) -> float:
+    ix = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    iy = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = ix * iy
+    area_a = (ax1 - ax0) * (ay1 - ay0)
+    area_b = (bx1 - bx0) * (by1 - by0)
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _nms_filter(raw_elems: List[Dict[str, Any]], iou_thresh: float, prefer_leaves: bool) -> List[Dict[str, Any]]:
+    """
+    Simple greedy NMS. Keeps leaves-first, then by area descending.
+    Returns the kept subset (original order preserved).
+    """
+    def sort_key(e):
+        leaf_score = 0 if (prefer_leaves and e["is_leaf"]) else 1
+        return (leaf_score, -e["area_px"])
+
+    sorted_e = sorted(raw_elems, key=sort_key)
+    kept = []
+    suppressed = set()
+
+    for i, e in enumerate(sorted_e):
+        if i in suppressed:
+            continue
+        kept.append(e)
+        for j in range(i + 1, len(sorted_e)):
+            if j in suppressed:
+                continue
+            o = sorted_e[j]
+            iou = _iou_2d(
+                e["x0_px"], e["y0_px"], e["x1_px"], e["y1_px"],
+                o["x0_px"], o["y0_px"], o["x1_px"], o["y1_px"],
+            )
+            if iou >= iou_thresh:
+                suppressed.add(j)
+
+    return kept
+
+
+# ----- M rounding utility -----
+
+def round_up_to_multiple(value: int, base: int = 5) -> int:
+    """Round value up to the nearest multiple of base."""
+    return int(math.ceil(value / base) * base)
+
+
 def rico_semantic_json_to_elements(data: Dict[str, Any]) -> Tuple[Tuple[float, float], List[Dict[str, Any]]]:
     """
-    Robust version:
-      - Accepts root bounds as [x0,y0,x1,y1] OR [x,y,w,h]
-      - If root invalid, infers screen bbox from all nodes
+    Parses a RICO semantic JSON following the official LayoutDM filtering rules:
+
+    1. Strict label whitelist — only elements whose componentLabel is in RICO25_LABELS
+       are kept. Containers, ViewGroups and unlabelled nodes are dropped implicitly.
+
+    2. is_valid geometric check — elements partially or fully outside the screen
+       boundaries, or with degenerate size, are dropped.
+
+    3. (optional) NMS — near-duplicate boxes (IoU >= NMS_IOU_THRESHOLD) are removed,
+       keeping leaf nodes first. Set NMS_IOU_THRESHOLD=1.0 to disable.
     """
     root_bounds = data.get("bounds")
     if not isinstance(root_bounds, list):
@@ -119,11 +202,9 @@ def rico_semantic_json_to_elements(data: Dict[str, Any]) -> Tuple[Tuple[float, f
 
     x0, y0, x1, y1 = rb
 
-    # For RICO, infer the design resolution
+    # Infer design resolution (RICO screens are portrait with origin at 0,0)
     sum_w = x0 + x1
     sum_h = y0 + y1
-
-    # Common RICO design resolutions
     candidates = [(720, 1280), (1080, 1920), (1440, 2560)]
     design_w, design_h = min(candidates, key=lambda wh: abs(wh[0] - sum_w) + abs(wh[1] - sum_h))
 
@@ -131,7 +212,7 @@ def rico_semantic_json_to_elements(data: Dict[str, Any]) -> Tuple[Tuple[float, f
     if DROP_ROOT and nodes:
         nodes = nodes[1:]
 
-    elements = []
+    raw_elems = []
     for n in nodes:
         b = n.get("bounds")
         if not isinstance(b, list):
@@ -141,29 +222,46 @@ def rico_semantic_json_to_elements(data: Dict[str, Any]) -> Tuple[Tuple[float, f
             continue
         nx0, ny0, nx1, ny1 = nb
 
-        w_px = nx1 - nx0
-        h_px = ny1 - ny0
-        if w_px <= 0 or h_px <= 0:
+        # --- 1. Label whitelist (official LayoutDM filter) ---
+        category = n.get("componentLabel") or ""
+        if category not in RICO25_LABELS:
+            continue  # drops containers, generic views, unlabelled nodes
+
+        # --- 2. is_valid: geometric bounds check (official LayoutDM filter) ---
+        # Element must be fully within screen boundaries
+        if nx0 < 0 or ny0 < 0 or nx1 > design_w or ny1 > design_h:
+            continue
+        # Element must have positive size (already guaranteed by _normalize_bounds,
+        # but mirroring the official check explicitly)
+        if nx1 <= nx0 or ny1 <= ny0:
             continue
 
-        # Use absolute coordinates directly, normalized by design resolution
-        x_c = (nx0 + nx1) / 2.0
-        y_c = (ny0 + ny1) / 2.0
+        raw_elems.append({
+            "category": category,
+            "x0_px": nx0, "y0_px": ny0,
+            "x1_px": nx1, "y1_px": ny1,
+            "area_px": (nx1 - nx0) * (ny1 - ny0),
+            "is_leaf": _is_leaf(n),
+        })
 
-        # Normalize by design resolution (this matches the yellow line approach)
-        x = x_c / design_w
-        y = y_c / design_h
-        w = w_px / design_w
-        h = h_px / design_h
+    # --- 3. Optional NMS (extra, not in official repo) ---
+    if NMS_IOU_THRESHOLD < 1.0 and raw_elems:
+        raw_elems = _nms_filter(raw_elems, NMS_IOU_THRESHOLD, PREFER_LEAVES)
 
-        # Clamp to reasonable range
+    # Normalize to [0,1] center-format (xc, yc, w, h)
+    elements = []
+    for e in raw_elems:
+        nx0, ny0, nx1, ny1 = e["x0_px"], e["y0_px"], e["x1_px"], e["y1_px"]
+        x = (nx0 + nx1) / 2.0 / design_w
+        y = (ny0 + ny1) / 2.0 / design_h
+        w = (nx1 - nx0) / design_w
+        h = (ny1 - ny0) / design_h
+        # Clamp for safety (should already be in range after is_valid)
         x = max(0.0, min(1.0, x))
         y = max(0.0, min(1.0, y))
         w = max(0.0, min(1.0, w))
         h = max(0.0, min(1.0, h))
-
-        category = n.get("componentLabel") or n.get("class") or "UNKNOWN"
-        elements.append({"category": str(category), "x": x, "y": y, "w": w, "h": h})
+        elements.append({"category": e["category"], "x": x, "y": y, "w": w, "h": h})
 
     return (design_w, design_h), elements
 
@@ -184,6 +282,8 @@ def load_all_screens(semantic_dir: str) -> List[Dict[str, Any]]:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             (W, H), elements = rico_semantic_json_to_elements(data)
+            if len(elements) == 0:
+                continue  # skip empty screens (all elements filtered out)
             screens.append({
                 "id": os.path.splitext(fname)[0],
                 "screen_w": W,
@@ -191,11 +291,10 @@ def load_all_screens(semantic_dir: str) -> List[Dict[str, Any]]:
                 "elements": elements,
             })
         except Exception as e:
-            # correctness > speed: don't crash whole run, record failures
             bad.append((fname, str(e)))
 
     if bad:
-        print(f"\n[WARN] {len(bad)} files could not be parsed into screens. Showing first 20:")
+        print(f"\n[WARN] {len(bad)} files could not be parsed. Showing first 20:")
         for fn, err in bad[:20]:
             print(" -", fn, "->", err)
 
@@ -270,8 +369,7 @@ def _collect_values_for_modality(screens: List[Dict[str, Any]], key: str) -> np.
     for s in screens:
         for e in s["elements"]:
             vals.append(e[key])
-    arr = np.array(vals, dtype=np.float32)
-    return arr
+    return np.array(vals, dtype=np.float32)
 
 
 def _maybe_subsample(arr: np.ndarray, limit: int, seed: int) -> np.ndarray:
@@ -283,12 +381,7 @@ def _maybe_subsample(arr: np.ndarray, limit: int, seed: int) -> np.ndarray:
 
 
 def fit_kmeans_1d(values: np.ndarray, n_clusters: int, seed: int) -> Tuple[np.ndarray, KMeans]:
-    """
-    Fit 1D KMeans. Returns sorted centroids (ascending) and the fitted model.
-    """
-    # KMeans expects 2D
     X = values.reshape(-1, 1)
-
     km = KMeans(
         n_clusters=n_clusters,
         random_state=seed,
@@ -296,22 +389,11 @@ def fit_kmeans_1d(values: np.ndarray, n_clusters: int, seed: int) -> Tuple[np.nd
         max_iter=KMEANS_MAX_ITER,
     )
     km.fit(X)
-
-    centers = km.cluster_centers_.reshape(-1)
-    # Sort centers; we will use nearest-center assignment ourselves
-    centers_sorted = np.sort(centers)
+    centers_sorted = np.sort(km.cluster_centers_.reshape(-1))
     return centers_sorted.astype(np.float32), km
 
 
 def assign_to_nearest_centroid(values: np.ndarray, centroids: np.ndarray) -> np.ndarray:
-    """
-    values: [N] float
-    centroids: [B] float sorted
-    returns: [N] int in [0..B-1]
-    """
-    # For simplicity and correctness: brute-force with broadcasting.
-    # (Not the fastest, but clear.)
-    # distances: [N, B]
     distances = np.abs(values.reshape(-1, 1) - centroids.reshape(1, -1))
     return distances.argmin(axis=1).astype(np.int64)
 
@@ -327,70 +409,50 @@ def build_tokens_for_screens(
     bins: int,
 ) -> torch.LongTensor:
     """
-    Returns tokens: LongTensor [N, M, 5] where each row: (c_id, x_id, y_id, w_id, h_id)
-    Tokens are discrete and PAD is applied.
+    Returns LongTensor [N, M, 5] where each position is (c_id, x_id, y_id, w_id, h_id).
+    Positions beyond the real element count are filled with PAD tokens.
 
     Special token ids:
-      - For category: C classes => mask_id=C, pad_id=C+1
-      - For bins: B => mask_id=B, pad_id=B+1
+      - category: vocab_size = C+2, mask_id = C, pad_id = C+1
+      - x/y/w/h : vocab_size = B+2, mask_id = B, pad_id = B+1
     """
-    modalities = ["c", "x", "y", "w", "h"]
     N = len(screens)
     C = len(cat2id)
-
-    # Special IDs
-    c_mask_id = C
     c_pad_id = C + 1
-
-    b_mask_id = bins
     b_pad_id = bins + 1
 
     tokens = torch.empty((N, M, 5), dtype=torch.long)
 
     for i, s in enumerate(screens):
         elems = s["elements"]
-
-        # If more than M, truncate (simple rule: keep first M as-is)
+        # Screens longer than M were discarded in main(); this is a safety truncation only.
         elems = elems[:M]
 
-        # Build arrays for vectorized centroid assignment
-        # Categories
-        c_ids = []
-        xs, ys, ws, hs = [], [], [], []
-
+        c_ids, xs, ys, ws, hs = [], [], [], [], []
         for e in elems:
             c_ids.append(cat2id.get(e["category"], None))
-            xs.append(e["x"])
-            ys.append(e["y"])
-            ws.append(e["w"])
-            hs.append(e["h"])
+            xs.append(e["x"]); ys.append(e["y"])
+            ws.append(e["w"]); hs.append(e["h"])
 
-        # Convert to numpy
         xs = np.array(xs, dtype=np.float32)
         ys = np.array(ys, dtype=np.float32)
         ws = np.array(ws, dtype=np.float32)
         hs = np.array(hs, dtype=np.float32)
 
-        # Assign bins
         x_ids = assign_to_nearest_centroid(xs, centroids["x"]) if xs.size else np.array([], dtype=np.int64)
         y_ids = assign_to_nearest_centroid(ys, centroids["y"]) if ys.size else np.array([], dtype=np.int64)
         w_ids = assign_to_nearest_centroid(ws, centroids["w"]) if ws.size else np.array([], dtype=np.int64)
         h_ids = assign_to_nearest_centroid(hs, centroids["h"]) if hs.size else np.array([], dtype=np.int64)
 
-        # Fill tokens for real elements
         n_real = len(elems)
         if n_real > 0:
-            # categories: if unknown category (shouldn't happen if cat2id built on train),
-            # map to PAD? Here we map unknown to last valid category 0; but normally none.
             c_arr = np.array([ci if ci is not None else 0 for ci in c_ids], dtype=np.int64)
-
             tokens[i, :n_real, 0] = torch.from_numpy(c_arr)
             tokens[i, :n_real, 1] = torch.from_numpy(x_ids)
             tokens[i, :n_real, 2] = torch.from_numpy(y_ids)
             tokens[i, :n_real, 3] = torch.from_numpy(w_ids)
             tokens[i, :n_real, 4] = torch.from_numpy(h_ids)
 
-        # Fill PAD for remaining slots
         if n_real < M:
             tokens[i, n_real:, 0] = c_pad_id
             tokens[i, n_real:, 1] = b_pad_id
@@ -449,16 +511,30 @@ def main():
 
     print("Loading screens from:", RICO_SEMANTIC_DIR)
     screens = load_all_screens(RICO_SEMANTIC_DIR)
-    print("Total screens:", len(screens))
+    print(f"Total screens after label-whitelist + is_valid filtering: {len(screens)}")
 
+    # Count elements AFTER per-element filtering (whitelist + geometry + optional NMS)
     counts = [len(s["elements"]) for s in screens]
     stats = describe_counts(counts)
-    print("\nElement count stats:", json.dumps(stats, indent=2))
+    print("\nElement count stats (post element-filtering):", json.dumps(stats, indent=2))
 
-    # M = choose_M_from_counts(counts, percentile=M_PERCENTILE)
-    M = FORCE_M
-    print(f"\nChosen M (fixed): {M}")
-    print(f"Reference only - percentile p{M_PERCENTILE}: {choose_M_from_counts(counts, percentile=M_PERCENTILE)}")
+    # Compute M dynamically from the filtered distribution, rounded to nearest multiple of M_ROUND_BASE
+    M_raw = choose_M_from_counts(counts, percentile=M_PERCENTILE)
+    M = round_up_to_multiple(M_raw, base=M_ROUND_BASE)
+    print(f"\nChosen M: p{M_PERCENTILE}_raw={M_raw} -> rounded to multiple of {M_ROUND_BASE}: M={M}")
+
+    # --- Screen-level length filter (official LayoutDM behavior) ---
+    # Discard screens whose element count exceeds M so every sample fits in [N, M, 5]
+    # with no truncation. This matches: `if N == 0 or self.max_seq_length < N: continue`
+    before = len(screens)
+    if DISCARD_LONG_SCREENS:
+        screens = [s for s in screens if len(s["elements"]) <= M]
+        discarded = before - len(screens)
+        print(f"\nDiscarded {discarded} screens with N > M={M}  "
+              f"({discarded / before * 100:.1f}% of dataset)")
+    else:
+        print(f"\nDISCARD_LONG_SCREENS=False: screens with N > M will be truncated.")
+    print(f"Screens remaining: {len(screens)}")
 
     # Split
     train_idx, val_idx, test_idx = split_ids(
@@ -470,8 +546,8 @@ def main():
     )
 
     train_screens = [screens[i] for i in train_idx]
-    val_screens = [screens[i] for i in val_idx]
-    test_screens = [screens[i] for i in test_idx]
+    val_screens   = [screens[i] for i in val_idx]
+    test_screens  = [screens[i] for i in test_idx]
 
     print("\nSplit sizes:",
           "train", len(train_screens),
@@ -489,7 +565,6 @@ def main():
     ws = _collect_values_for_modality(train_screens, "w")
     hs = _collect_values_for_modality(train_screens, "h")
 
-    # Optional subsample for KMeans stability and memory
     xs_fit = _maybe_subsample(xs, KMEANS_SAMPLE_LIMIT, SEED + 1)
     ys_fit = _maybe_subsample(ys, KMEANS_SAMPLE_LIMIT, SEED + 2)
     ws_fit = _maybe_subsample(ws, KMEANS_SAMPLE_LIMIT, SEED + 3)
@@ -508,33 +583,27 @@ def main():
     # Build tokens for each split
     print("\nBuilding tokens...")
     train_tokens = build_tokens_for_screens(train_screens, M, cat2id, centroids, BINS)
-    val_tokens = build_tokens_for_screens(val_screens, M, cat2id, centroids, BINS)
-    test_tokens = build_tokens_for_screens(test_screens, M, cat2id, centroids, BINS)
+    val_tokens   = build_tokens_for_screens(val_screens,   M, cat2id, centroids, BINS)
+    test_tokens  = build_tokens_for_screens(test_screens,  M, cat2id, centroids, BINS)
 
     # Save artifacts
     train_path = os.path.join(OUT_DIR, "tokens_train.pt")
-    val_path = os.path.join(OUT_DIR, "tokens_val.pt")
-    test_path = os.path.join(OUT_DIR, "tokens_test.pt")
+    val_path   = os.path.join(OUT_DIR, "tokens_val.pt")
+    test_path  = os.path.join(OUT_DIR, "tokens_test.pt")
 
     torch.save(train_tokens, train_path)
-    torch.save(val_tokens, val_path)
-    torch.save(test_tokens, test_path)
+    torch.save(val_tokens,   val_path)
+    torch.save(test_tokens,  test_path)
 
-    # Save centroids for decoding
     torch.save(torch.from_numpy(centroids["x"]), os.path.join(OUT_DIR, "centroids_x.pt"))
     torch.save(torch.from_numpy(centroids["y"]), os.path.join(OUT_DIR, "centroids_y.pt"))
     torch.save(torch.from_numpy(centroids["w"]), os.path.join(OUT_DIR, "centroids_w.pt"))
     torch.save(torch.from_numpy(centroids["h"]), os.path.join(OUT_DIR, "centroids_h.pt"))
 
-    # Save cat2id
     with open(os.path.join(OUT_DIR, "cat2id.json"), "w", encoding="utf-8") as f:
         json.dump(cat2id, f, ensure_ascii=False, indent=2)
 
-    # Guardar los IDs reales de cada split.
-    # IMPORTANTE: no se puede reconstruir este mapeo desde fuera porque load_all_screens
-    # filtra los JSONs que fallan al parsear. Cualquier código externo que intente
-    # reconstruir el split usando len(all_json_files) obtendrá un n distinto y por
-    # tanto un shuffle distinto → desalineamiento índice/token.
+    # Save split screen IDs — required for correct alignment in decode/debug utilities
     split_screen_ids = {
         "train": [screens[i]["id"] for i in train_idx],
         "val":   [screens[i]["id"] for i in val_idx],
@@ -543,10 +612,6 @@ def main():
     with open(os.path.join(OUT_DIR, "split_ids.json"), "w", encoding="utf-8") as f:
         json.dump(split_screen_ids, f, ensure_ascii=False, indent=2)
 
-    # Build vocab_meta for training loop
-    # Special IDs:
-    #   category: vocab = C + 2, mask_id = C, pad_id = C+1
-    #   x/y/w/h : vocab = B + 2, mask_id = B, pad_id = B+1
     vocab_meta = {
         "c": {"vocab_size": C + 2, "mask_id": C, "pad_id": C + 1},
         "x": {"vocab_size": BINS + 2, "mask_id": BINS, "pad_id": BINS + 1},
@@ -554,11 +619,19 @@ def main():
         "w": {"vocab_size": BINS + 2, "mask_id": BINS, "pad_id": BINS + 1},
         "h": {"vocab_size": BINS + 2, "mask_id": BINS, "pad_id": BINS + 1},
         "M": M,
+        "M_raw": M_raw,
+        "M_round_base": M_ROUND_BASE,
         "bins": BINS,
         "seed": SEED,
         "split": {"train": TRAIN_RATIO, "val": VAL_RATIO, "test": TEST_RATIO},
         "M_percentile": M_PERCENTILE,
-        "M_fixed": FORCE_M,
+        "filter": {
+            "rico25_labels": sorted(RICO25_LABELS),
+            "nms_iou_threshold": NMS_IOU_THRESHOLD,
+            "prefer_leaves": PREFER_LEAVES,
+            "discard_long_screens": DISCARD_LONG_SCREENS,
+            "drop_root": DROP_ROOT,
+        },
     }
     with open(os.path.join(OUT_DIR, "vocab_meta.json"), "w", encoding="utf-8") as f:
         json.dump(vocab_meta, f, ensure_ascii=False, indent=2)
@@ -567,20 +640,24 @@ def main():
     print(" -", train_path)
     print(" -", val_path)
     print(" -", test_path)
-    print(f"  vocab_meta.json, cat2id.json, centroids_*.pt, split_ids.json")
+    print(f"  vocab_meta.json (M={M}), cat2id.json, centroids_*.pt, split_ids.json")
 
-    # Quick sanity prints
     print("\nSanity check:")
     print("train_tokens shape:", tuple(train_tokens.shape), "dtype:", train_tokens.dtype)
     print("Example first row (first 3 elements):\n", train_tokens[0, :3, :])
 
     sanity_check_decoded(train_tokens, centroids, vocab_meta)
 
+    return screens
+
+
+
 # Clean up any previously downloaded corrupted files
 !rm -f semantic_annotations.zip semantic_annotations.zip
 
 # Use the direct download link for Google Cloud Storage
 !wget -O semantic_annotations.zip https://storage.googleapis.com/crowdstf-rico-uiuc-4540/rico_dataset_v0.1/semantic_annotations.zip?alt=media
+
 
 import zipfile
 
@@ -772,7 +849,10 @@ render_debug_overlays(
         draw_labels=False,
     )
 
-OUT_DIR
+from IPython.display import display, Image as IPImage
+
+display(IPImage(filename="/content/layoutdm_rico_tokens/debug_overlays/grid_overlays.png"))
+
 
 DRIVE_ARTIFACTS_DIR = '/content/drive/MyDrive/data/layoutdm_artifacts'
 
@@ -780,36 +860,37 @@ train_path = os.path.join(OUT_DIR, "tokens_train.pt")
 val_path = os.path.join(OUT_DIR, "tokens_val.pt")
 test_path = os.path.join(OUT_DIR, "tokens_test.pt")
 
+
+
 cp /content/layoutdm_rico_tokens/tokens_train.pt /content/drive/MyDrive/data/layoutdm_artifacts
+
 
 cp /content/layoutdm_rico_tokens/tokens_val.pt /content/drive/MyDrive/data/layoutdm_artifacts
 
+
+
 cp /content/layoutdm_rico_tokens/tokens_test.pt /content/drive/MyDrive/data/layoutdm_artifacts
+
 
 cp /content/layoutdm_rico_tokens/vocab_meta.json /content/drive/MyDrive/data/layoutdm_artifacts
 
+
 cp /content/layoutdm_rico_tokens/centroids_x.pt /content/drive/MyDrive/data/layoutdm_artifacts
+
 
 cp /content/layoutdm_rico_tokens/centroids_y.pt /content/drive/MyDrive/data/layoutdm_artifacts
 
+
 cp /content/layoutdm_rico_tokens/centroids_w.pt /content/drive/MyDrive/data/layoutdm_artifacts
 
+
 cp /content/layoutdm_rico_tokens/centroids_h.pt /content/drive/MyDrive/data/layoutdm_artifacts
+
 
 cp /content/layoutdm_rico_tokens/cat2id.json /content/drive/MyDrive/data/layoutdm_artifacts
 
 
-
-
-
-
-
-
-
-
-
-
-
+tokens_train = torch.load(os.path.join(OUT_DIR, "tokens_train.pt")).cpu()
 
 
 
