@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""LayoutDM (preprocesamiento iter3).ipynb
+"""LayoutDM (preprocesamiento iter4).ipynb
 
 
 """
@@ -49,6 +49,7 @@ TEST_RATIO = 0.10
 
 # Percentile used to choose M
 M_PERCENTILE = 95  # choose M as p95 of element counts
+FORCE_M = 25
 MIN_AREA = 0.0     # "take all": we keep 0.0; still we reject w<=0 or h<=0
 DROP_ROOT = True   # do not include root node itself as element
 
@@ -454,8 +455,10 @@ def main():
     stats = describe_counts(counts)
     print("\nElement count stats:", json.dumps(stats, indent=2))
 
-    M = choose_M_from_counts(counts, percentile=M_PERCENTILE)
-    print(f"\nChosen M (p{M_PERCENTILE}): {M}")
+    # M = choose_M_from_counts(counts, percentile=M_PERCENTILE)
+    M = FORCE_M
+    print(f"\nChosen M (fixed): {M}")
+    print(f"Reference only - percentile p{M_PERCENTILE}: {choose_M_from_counts(counts, percentile=M_PERCENTILE)}")
 
     # Split
     train_idx, val_idx, test_idx = split_ids(
@@ -555,6 +558,7 @@ def main():
         "seed": SEED,
         "split": {"train": TRAIN_RATIO, "val": VAL_RATIO, "test": TEST_RATIO},
         "M_percentile": M_PERCENTILE,
+        "M_fixed": FORCE_M,
     }
     with open(os.path.join(OUT_DIR, "vocab_meta.json"), "w", encoding="utf-8") as f:
         json.dump(vocab_meta, f, ensure_ascii=False, indent=2)
