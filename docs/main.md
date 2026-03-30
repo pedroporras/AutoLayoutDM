@@ -74,17 +74,11 @@ Entrena LayoutDM sobre esos tensores discretos.
 
 ---
 
-## Paso 1. Entender qué trae RICO
+## 4.1. Lectura del dataset RICO
 
 RICO no viene listo para LayoutDM.
 
-RICO trae principalmente:
-
-* screenshots
-* archivos JSON por pantalla
-* jerarquía de componentes UI
-
-Un JSON típico de `semantic_annotations` tiene esta pinta:
+Partimos de los archivos en `semantic_annotations/`, donde cada JSON representa una pantalla con su árbol de componentes. Un JSON típico tiene esta pinta:
 
 ```json
 {
@@ -100,426 +94,387 @@ Un JSON típico de `semantic_annotations` tiene esta pinta:
 }
 ```
 
-Esto representa una pantalla con:
+La lógica del parser:
 
-* un nodo raíz
-* hijos
-* bounds en píxeles
-* clase del componente
-* a veces `componentLabel`
+1. recorrer recursivamente todos los nodos (`children`)
+2. leer `bounds` de cada nodo
+3. convertirlos a coordenadas normalizadas
+4. guardar cada nodo como un elemento estructurado usando `componentLabel` si existe, `class` si no
 
 ---
 
-## Paso 2. Entender qué necesita LayoutDM
+## 4.2. Problema inicial: `Invalid screen size from root bounds`
 
-LayoutDM no consume JSON ni imágenes.
-
-Consume una secuencia de elementos con esta estructura:
-
-`(c, x, y, w, h)`
-
-Pero no en continuo, sino en **discreto**.
-
-Es decir, al final lo que necesita es algo como:
+Al ejecutar el builder apareció este error en algunos archivos:
 
 ```python
-[c_id, x_id, y_id, w_id, h_id]
+ValueError: Invalid screen size from root bounds.
 ```
 
-y agrupado en un tensor:
+El script asumía que el root siempre venía como `[x0, y0, x1, y1]`, pero algunos archivos tenían bounds dañados, vacíos o con valores imposibles.
 
-```python
-[N, M, 5]
-```
+### Qué hicimos
 
-donde:
+Se reforzó el parser para:
 
-* `N` = número de pantallas
-* `M` = máximo número de elementos por pantalla
-* `5` = `(c, x, y, w, h)`
+1. intentar normalizar bounds (interpretar como `[x0,y0,x1,y1]` o como `[x,y,w,h]`)
+2. inferir el tamaño de pantalla desde el árbol completo cuando el root no era válido
+3. si no había forma de inferirlo, saltarse ese archivo y registrar warning
+
+### Resultado real del dataset
+
+* **66 195 screens** se pudieron procesar correctamente
+* **66 archivos** no pudieron parsearse porque realmente no tenían geometría utilizable
+
+Esto no es un bug del pipeline, sino una condición real del dataset.
 
 ---
 
-## Paso 3. Convertir el árbol JSON a lista plana de elementos
+## 4.3. Estadísticas del dataset y elección de `M`
 
-El JSON de RICO viene como árbol.
-
-Pero LayoutDM no usa la jerarquía.
-
-Por eso el primer paso fue recorrer recursivamente el JSON y extraer todos los nodos con:
-
-* categoría
-* bounds válidos
-
-Eso se hace con un parser que:
-
-* recorre `children`
-* lee `bounds`
-* usa `componentLabel` si existe
-* si no existe, usa `class`
-
-El resultado es una lista plana como esta:
-
-```python
-[
-  {
-    "category": "Web View",
-    "x": 0.5,
-    "y": 0.467,
-    "w": 1.0,
-    "h": 0.934
-  }
-]
-```
-
----
-
-## Paso 4. Normalizar coordenadas
-
-RICO trae los bounds en píxeles:
-
-`[x0, y0, x1, y1]`
-
-LayoutDM necesita:
-
-* `x, y` = centro
-* `w, h` = tamaño
-* todo normalizado entre 0 y 1
-
-La conversión es:
-
-```text
-width_px  = x1 - x0
-height_px = y1 - y0
-
-x_center = (x0 + x1) / 2
-y_center = (y0 + y1) / 2
-
-x = x_center / screen_width
-y = y_center / screen_height
-w = width_px / screen_width
-h = height_px / screen_height
-```
-
-Esto fue clave porque el modelo no puede trabajar directamente con coordenadas absolutas de píxeles.
-
----
-
-## Paso 5. Entender el formato intermedio
-
-Antes de discretizar, obtuvimos un formato intermedio:
-
-```python
-[
-  ("Web View", 0.50, 0.467, 1.00, 0.934),
-  ("[PAD]", 0.0, 0.0, 0.0, 0.0),
-  ...
-]
-```
-
-Eso aún **no es LayoutDM final**, pero ya tiene la estructura correcta.
-
-Todavía faltaba:
-
-* convertir categoría a id
-* cuantizar `x,y,w,h` con KMeans
-
----
-
-## Paso 6. Elegir `M`
-
-Como cada pantalla tiene distinto número de elementos, necesitábamos fijar un máximo `M`.
-
-Eso significa:
+`M` es el número máximo de elementos por pantalla. Como cada pantalla tiene distinto número de elementos, `M` define la longitud fija del tensor:
 
 * si una pantalla tiene menos de `M` elementos → se rellena con `PAD`
 * si tiene más de `M` → se recorta
 
-La forma correcta de elegir `M` fue calcular estadísticas del dataset:
+Estadísticas reales del conteo de elementos por pantalla:
 
-* mínimo
-* p50
-* p90
-* p95
-* p99
-* máximo
+| Percentil | Valor |
+|---|---|
+| p50 | 14 |
+| p90 | 43 |
+| **p95** | **55** |
+| max | 423 |
 
-Y usar:
+### Decisión
 
-```text
-M = percentil 95
+```python
+M = p95 = 55
 ```
 
-Esto es una decisión práctica razonable porque:
+Esto es razonable porque:
 
-* evita que unos pocos casos extremos hagan crecer demasiado la secuencia
-* conserva casi todas las pantallas sin truncar demasiado
-
----
-
-## Paso 7. Hacer split train/val/test
-
-Antes de cuantizar, había que separar los datos:
-
-* train
-* val
-* test
-
-Esto es importante porque el paper y una implementación correcta asumen que todo lo aprendido del dataset se ajusta **solo con train**.
-
-Eso aplica especialmente a KMeans.
+* captura el 95% de las pantallas sin truncamiento
+* evita que unos pocos outliers (hasta 423 elementos) inflen el tensor innecesariamente
+* permite un entrenamiento mucho más estable que usar el máximo absoluto
 
 ---
 
-## Paso 8. Cuantización con KMeans
+## 4.4. Split del dataset
 
-Este fue uno de los puntos más importantes.
+Se dividieron las **pantallas válidas** (las 66 195) en:
 
-LayoutDM no usa coordenadas continuas directamente.
+| Split | Tamaño |
+|---|---|
+| train | 52 956 |
+| val | 6 619 |
+| test | 6 620 |
+
+Proporciones: 80 / 10 / 10, reproducible con `SEED = 42`.
+
+**Importante**: el split se hizo sobre `len(screens)` (pantallas parseables), no sobre `len(json_files)` (total de archivos). Esa distinción fue clave para evitar el bug de índices descrito en la sección 6.
+
+---
+
+## 4.5. Construcción del vocabulario de categorías
+
+A partir del split train se creó `cat2id` usando **solo train**:
+
+```json
+{
+  "Button": 0,
+  "Web View": 1,
+  "Text": 2,
+  ...
+}
+```
+
+Resultado real: **25 categorías** en train.
+
+Igual que en las modalidades espaciales, se reservaron ids especiales:
+
+* `mask_id = C`
+* `pad_id = C + 1`
+
+donde `C = 25`.
+
+---
+
+## 4.6. Discretización geométrica con KMeans
+
+LayoutDM no usa coordenadas continuas.
 Usa coordenadas **discretizadas**.
 
-Para eso entrenamos 4 KMeans independientes sobre el split de train:
+Para eso se entrenaron 4 KMeans independientes sobre el split de train:
 
 * uno para `x`
 * uno para `y`
 * uno para `w`
 * uno para `h`
 
-Elegimos por defecto:
-
-```text
-BINS = 64
-```
+Con `BINS = 64` clusters cada uno.
 
 ### Por qué 64 bins
 
-Porque es un balance razonable entre:
+Balance entre:
 
 * suficiente resolución espacial
-* vocabulario no muy grande
+* vocabulario no demasiado grande
 * entrenamiento estable
-* complejidad manejable
 
-Con 64 bins:
+Con 64 bins por modalidad:
 
-* cada modalidad espacial tiene vocabulario `64 + 2`
-* los `+2` son `[MASK]` y `[PAD]`
-
-Entonces:
-
-* `x_id, y_id, w_id, h_id` quedan entre `0..63`
+* `x_id, y_id, w_id, h_id` quedan en `0..63`
 * `mask_id = 64`
 * `pad_id = 65`
+* vocabulario por modalidad geométrica: `64 + 2 = 66`
 
 ---
 
-## Paso 9. Crear vocabulario de categorías
+## 4.7. Exportación de artefactos
 
-También necesitábamos discretizar la categoría.
+El pipeline exportó los siguientes archivos en `OUT_DIR`:
 
-Se construyó un diccionario `cat2id` usando **solo train**.
+| Archivo | Contenido |
+|---|---|
+| `tokens_train.pt` | `LongTensor [52956, 55, 5]` |
+| `tokens_val.pt` | `LongTensor [6619, 55, 5]` |
+| `tokens_test.pt` | `LongTensor [6620, 55, 5]` |
+| `centroids_x/y/w/h.pt` | `FloatTensor [64]` por modalidad |
+| `cat2id.json` | `{ "Button": 0, ... }` |
+| `vocab_meta.json` | vocab sizes, pad/mask ids, M, bins, seed, split ratios |
 
-Por ejemplo:
+El formato de `vocab_meta.json` es el contrato entre preprocesamiento y training loop.
 
-```json
-{
-  "Button": 0,
-  "Web View": 1,
-  "Text": 2
-}
+---
+
+# 5. Validación del preprocesamiento
+
+---
+
+## 5.1. Validación estadística
+
+Se verificó:
+
+* shape de `train_tokens`: `(52956, 55, 5)` ✅
+* dtype: `torch.int64` ✅
+* rangos de ids dentro de los vocabs esperados
+* consistencia del padding
+
+---
+
+## 5.2. Validación visual
+
+Se generaron overlays sobre screenshots reales, dibujando cajas reconstruidas desde los tokens:
+
+1. tomar una pantalla por `screen_id`
+2. decodificar sus tokens usando centroides
+3. dibujar los bounding boxes sobre la imagen real
+4. verificar si quedaban alineados con los elementos de la UI
+
+### Qué se observó inicialmente
+
+Los layouts parecían mal alineados en varios casos. Esto sugería alguno de estos problemas:
+
+* mala normalización
+* centroides incorrectos
+* screen size mal calculado
+* desalineación entre JSON e imagen
+* o error en el mapeo entre token row y pantalla original
+
+---
+
+# 6. Depuración del caso concreto: pantalla `"0"`
+
+Se analizó una pantalla específica con JSON muy simple:
+
+* root: `[0, 0, 1440, 2560]`
+* un solo hijo: clase `SystemWebView`, bounds `[0, 0, 1440, 2392]`
+
+---
+
+## 6.1. Lo esperado geométricamente
+
+Esa pantalla debería producir exactamente **1 elemento** con:
+
+* `x = 0.5`
+* `y = 0.4671875`
+* `w = 1.0`
+* `h = 0.934375`
+
+Una caja casi de pantalla completa.
+
+---
+
+## 6.2. Lo que devolvía el decode inicialmente
+
+El `decode_row_to_boxes` devolvía **7 cajas** pequeñas, concentradas arriba:
+
+* `y ≈ 0.064`
+* `h ≈ 0.065`
+* varias cajas tipo toolbar/lista
+
+Eso no coincidía en nada con el JSON.
+
+---
+
+## 6.3. Diagnóstico real
+
+Se reconstruyó el mapeo exacto entre `screens`, split train y posición en `tokens_train`:
+
+```
+idx_in_screens:    0
+split_name:        train
+pos_in_split_tokens: 44822
+real_n (non-pad elems): 1
 ```
 
-Y igual que en las modalidades espaciales:
+### Conclusión
 
-* `mask_id = C`
-* `pad_id = C + 1`
+El problema **no era** la tokenización ni el decode.
 
-donde `C` es el número de categorías reales.
+El problema era que se estaba inspeccionando el row incorrecto:
+
+* se miraba `train_tokens[0]`
+* pero el screen `"0"` estaba en `train_tokens[44822]`
+
+Esto ocurrió porque el split se hizo sobre `screens` válidos, mientras que los scripts de debug usaban índices basados en `json_files` completos, incluyendo los 66 archivos fallidos. Eso desplazaba el índice.
 
 ---
 
-## Paso 10. Exportar tokens listos para entrenar
+## 6.4. Lección aprendida
 
-Después de eso, cada pantalla quedó representada como:
+> En datasets preprocesados **nunca** se debe asumir que `tokens_train[i]` corresponde al archivo `i.json`.
+
+Puede haber archivos descartados, shuffles, splits o filtros previos que desplacen los índices.
+
+### Solución recomendada
+
+Guardar siempre los ids exactos por split:
 
 ```python
-[
-  [c_id, x_id, y_id, w_id, h_id],
-  [c_id, x_id, y_id, w_id, h_id],
-  ...
-  [pad, pad, pad, pad, pad]
-]
+# En el builder, al final de main():
+with open(os.path.join(OUT_DIR, "ids_train.json"), "w", encoding="utf-8") as f:
+    json.dump([s["id"] for s in train_screens], f, indent=2)
+
+with open(os.path.join(OUT_DIR, "ids_val.json"), "w", encoding="utf-8") as f:
+    json.dump([s["id"] for s in val_screens], f, indent=2)
+
+with open(os.path.join(OUT_DIR, "ids_test.json"), "w", encoding="utf-8") as f:
+    json.dump([s["id"] for s in test_screens], f, indent=2)
 ```
 
-Y agrupado en tensores:
-
-* `tokens_train.pt`
-* `tokens_val.pt`
-* `tokens_test.pt`
-
-Además se exportaron:
-
-* `cat2id.json`
-* `vocab_meta.json`
-* `centroids_x.pt`
-* `centroids_y.pt`
-* `centroids_w.pt`
-* `centroids_h.pt`
-
-Estos archivos son los artefactos necesarios para conectar el dataset con el training loop.
+Así el debug y los overlays se hacen por `screen_id`, no por posición asumida.
 
 ---
 
-# 5. Aspectos importantes que no se deben olvidar
+# 7. Aspectos importantes que no se deben olvidar
 
-## 5.1 El dataset dummy no sirve para resultados reales
+## 7.1. El preprocesamiento no es solo conversión de formato
 
-Sirve solo para validar que el pipeline corre.
+También define qué elementos entran, cómo se normalizan, cómo se discretizan, y qué información pierde o conserva el modelo. Eso impacta directamente la calidad de LayoutDM.
 
-## 5.2 El schedule de diffusion debe ser el exacto del paper
+## 7.2. `M` es una decisión crítica
 
-En el notebook quedó como placeholder:
+* Si `M` es muy bajo: truncas layouts complejos
+* Si `M` es muy alto: entrenas con mucho padding y el modelo es menos eficiente
 
-`make_transition_params()`
+Usar `p95 = 55` fue una decisión equilibrada.
 
-Eso significa que la arquitectura estaba bien, pero no era una réplica experimental exacta hasta reemplazar esa función.
+## 7.3. KMeans introduce cuantización
 
-## 5.3 El shuffle de elementos por sample todavía faltaba
+Cuando reconstruyes desde tokens, no obtienes los valores exactos originales: obtienes una aproximación por centroides. Eso es normal. Por eso un pequeño error entre la caja real y la reconstruida en un overlay no siempre significa bug.
 
-El paper busca que el modelo no dependa del orden de los elementos.
+## 7.4. La trazabilidad screen_id ↔ token row es obligatoria
 
-Por eso, en una implementación más fiel, el Dataset debería hacer shuffle de los slots válidos antes de devolver cada muestra.
+Sin esa trazabilidad puedes diagnosticar mal el pipeline y creer que el modelo o el preprocesamiento fallan cuando en realidad estás mirando otro ejemplo.
 
-## 5.4 LayoutDM no entiende semántica profunda
+## 7.5. El schedule de diffusion debe ser el exacto del paper
 
-No sabe qué es “header” o “CTA” como concepto de producto.
-Solo aprende patrones geométricos y categóricos.
+En el notebook quedó como placeholder `make_transition_params()`. La arquitectura estaba bien, pero no era una réplica exacta hasta reemplazar esa función.
+
+## 7.6. El shuffle de elementos por sample todavía faltaba
+
+El paper busca que el modelo no dependa del orden de los elementos. En una implementación más fiel, el `Dataset` debería hacer shuffle de los slots válidos antes de devolver cada muestra.
+
+## 7.7. LayoutDM no entiende semántica profunda
+
+Solo aprende patrones geométricos y categóricos. No sabe qué es "header" o "CTA" como concepto de producto.
 
 ---
 
-# 6. Qué implementamos para el entrenamiento
-
-Después de preparar el dataset, vimos cómo implementar el loop mínimo de LayoutDM.
-
-La idea fue construir un sistema claro y correcto antes que rápido.
+# 8. Qué implementamos para el entrenamiento
 
 ---
 
-## 6.1 Entrada del modelo
-
-El modelo recibe:
+## 8.1. Entrada del modelo
 
 ```python
 tokens: [B, M, 5]
 ```
 
-donde cada token representa:
-
-* categoría
-* x
-* y
-* w
-* h
-
-Todos discretos.
+Cada token representa `(category, x, y, w, h)` en forma discreta.
 
 ---
 
-## 6.2 Qué arquitectura usamos
+## 8.2. Arquitectura
 
 Usamos un **Transformer encoder** como denoiser.
 
-No es autoregresivo.
-No es decoder-only.
-No genera token por token como un modelo de lenguaje.
-
-Eso es importante porque LayoutDM quiere modelar el layout completo y no depender de un orden fijo.
+No es autoregresivo, no es decoder-only, no genera token por token. LayoutDM modela el layout completo sin depender de un orden fijo.
 
 ---
 
-## 6.3 Qué hace el proceso de diffusion
+## 8.3. Proceso de diffusion
 
 Durante entrenamiento:
 
 1. tomamos un layout limpio `z0`
 2. elegimos un timestep `t`
-3. corrompemos `z0` hasta obtener `zt`
-4. el modelo intenta predecir una versión más limpia
+3. corrompemos `z0` → `zt`
+4. el modelo predice una versión más limpia
 
-Ese proceso se hace con **diffusion discreto**.
-
----
-
-## 6.4 Qué significa modality-wise diffusion
-
-No usamos una sola difusión para todo.
-
-Hay una difusión separada por modalidad:
-
-* categoría
-* x
-* y
-* w
-* h
-
-Eso evita mezclar vocabularios incompatibles.
-
-Por ejemplo:
-
-* una categoría no debería “transformarse” en un ancho
-* un token de `x` no debería caer en el espacio de `c`
+Eso se hace con **diffusion discreto**.
 
 ---
 
-## 6.5 Qué losses usamos
+## 8.4. Modality-wise diffusion
 
-El entrenamiento usa dos partes:
+Hay una difusión separada por modalidad (`c`, `x`, `y`, `w`, `h`). Esto evita mezclar vocabularios incompatibles. Una categoría no debería transformarse en un ancho.
 
-### A. VB loss
+---
 
-Es una KL entre:
+## 8.5. Loss
 
-* el posterior verdadero del diffusion
-* el posterior predicho por el modelo
+El entrenamiento usa dos partes combinadas:
 
-Esto es el corazón teórico del modelo.
+### VB loss
 
-### B. Aux loss
+KL entre el posterior verdadero del diffusion y el posterior predicho por el modelo. Es el corazón teórico del modelo.
 
-Una cross entropy para ayudar al modelo a reconstruir `z0`.
+### Aux loss
 
-Esto estabiliza el entrenamiento.
-
-La loss total fue:
+Cross entropy para ayudar al modelo a reconstruir `z0`. Estabiliza el entrenamiento.
 
 ```text
 loss_total = vb_loss + lambda_aux * aux_loss
-```
-
-con:
-
-```text
-lambda_aux = 0.1
+             con lambda_aux = 0.1
 ```
 
 ---
 
-## 6.6 Cómo se ignora PAD
+## 8.6. Máscara de PAD
 
-Los slots PAD no representan elementos reales.
-
-Por eso se construyó `pad_mask` y la loss se calcula solo sobre tokens válidos.
-
-Si PAD entra en la loss, el modelo aprende una distribución errónea.
+Los slots PAD no representan elementos reales. Se construyó `pad_mask` para que la loss se calcule **solo sobre tokens válidos**. Si PAD entra en la loss, el modelo aprende una distribución errónea.
 
 ---
 
-## 6.7 Qué hace el sampling unconditional
+## 8.7. Unconditional sampling
 
-En inferencia unconditional:
+En inferencia:
 
 1. se inicia todo en `[MASK]`
-2. se corre el reverse diffusion desde `T` hasta `1`
+2. se corre el reverse diffusion de `T` hasta `1`
 3. en cada paso el modelo predice distribuciones sobre tokens
 4. se samplea categóricamente
 5. al final se obtiene `z0`
@@ -528,81 +483,90 @@ Esto produce un layout nuevo desde cero.
 
 ---
 
-# 7. Explicación separada: Preprocesamiento
+# 9. Explicación separada: Preprocesamiento completo
 
 ## Objetivo
 
-Transformar los JSON de RICO en tensores discretos listos para LayoutDM.
+Transformar cada pantalla de RICO en una secuencia discreta utilizable por LayoutDM.
 
-## Flujo
+## Flujo paso a paso
 
-### Paso 1
+### Paso 1. Leer cada JSON
 
-Leer todos los JSON de `semantic_annotations/`.
+Se abre cada archivo en `semantic_annotations/` en orden alfabético (determinista).
 
-### Paso 2
+### Paso 2. Recorrer el árbol
 
-Recorrer cada árbol y extraer nodos con:
+Se recorren root y `children` recursivamente en pre-order.
 
-* categoría
-* bounds válidos
+### Paso 3. Extraer bounds
 
-### Paso 3
+De cada nodo se toman `[x0, y0, x1, y1]`.
 
-Convertir `bounds` a:
+### Paso 4. Convertir a `(x, y, w, h)` normalizado
 
-* `x`
-* `y`
-* `w`
-* `h`
+```text
+x = (x0 + x1) / 2 / screen_w
+y = (y0 + y1) / 2 / screen_h
+w = (x1 - x0) / screen_w
+h = (y1 - y0) / screen_h
+```
 
-normalizados entre 0 y 1.
+La resolución de pantalla se infiere haciendo snapping al candidato RICO más cercano (`720×1280`, `1080×1920`, `1440×2560`).
 
-### Paso 4
+### Paso 5. Determinar la categoría
 
-Calcular estadísticas de número de elementos por pantalla y elegir `M`.
+Prioridad: `componentLabel` > `class` > `"UNKNOWN"`
 
-### Paso 5
+### Paso 6. Construir lista de elementos por pantalla
 
-Hacer split train/val/test.
+```python
+{"category": ..., "x": ..., "y": ..., "w": ..., "h": ...}
+```
 
-### Paso 6
+### Paso 7. Calcular estadísticas y elegir `M`
 
-Construir `cat2id` usando solo train.
+`M = ceil(percentil_95)` sobre el conteo de elementos reales.
 
-### Paso 7
+### Paso 8. Construir `good_ids` / `bad_ids`
 
-Entrenar 4 KMeans en train:
+Antes de hacer el split, se filtra la lista a solo las pantallas parseables. El split opera sobre esta lista.
 
-* x
-* y
-* w
-* h
+### Paso 9. Dividir train/val/test
 
-### Paso 8
+Shuffle reproducible con `SEED = 42`, proporción 80/10/10.
 
-Asignar cada valor continuo al centroide más cercano.
+### Paso 10. Construir `cat2id`
 
-### Paso 9
+Solo desde train.
 
-Construir tensores `[N, M, 5]` con PAD.
+### Paso 11. Ajustar KMeans para x/y/w/h
 
-### Paso 10
+Solo desde train, con `BINS = 64`.
 
-Guardar artefactos:
+### Paso 12. Convertir cada elemento a tokens discretos
 
-* tokens
-* centroides
-* vocab_meta
-* cat2id
+```python
+[c_id, x_id, y_id, w_id, h_id]
+```
+
+### Paso 13. Aplicar padding hasta `M`
+
+Posiciones vacías reciben `pad_id` en todas las modalidades.
+
+### Paso 14. Exportar artefactos
+
+Tokens, centroides, `cat2id.json`, `vocab_meta.json`, y opcionalmente `ids_train/val/test.json`.
 
 ## Resultado
 
-El resultado del preprocesamiento es un dataset listo para el training loop.
+```python
+tokens_train: LongTensor [52956, 55, 5]
+```
 
 ---
 
-# 8. Explicación separada: Entrenamiento del modelo
+# 10. Explicación separada: Entrenamiento del modelo
 
 ## Objetivo
 
@@ -610,87 +574,125 @@ Entrenar un LayoutDM mínimo que aprenda a generar layouts discretos.
 
 ## Flujo
 
-### Paso 1
+### Paso 1. Cargar dataset
 
-Cargar:
+`tokens_train.pt`, `tokens_val.pt`, `vocab_meta.json`.
 
-* `tokens_train.pt`
-* `tokens_val.pt`
-* `vocab_meta.json`
+### Paso 2. Construir `LayoutTokenDataset`
 
-### Paso 2
+Un `Dataset` de PyTorch que devuelve `tokens` por índice.
 
-Construir el `LayoutTokenDataset`.
-
-### Paso 3
-
-Construir el modelo:
+### Paso 3. Construir el modelo
 
 * embeddings por modalidad
 * positional encoding
 * Transformer encoder
-* head por modalidad
+* head de salida por modalidad
 
-### Paso 4
+### Paso 4. Precomputar matrices de transición
 
-Precomputar matrices de transición `Qt` y acumuladas `Qbar`.
+`Qt` (por timestep) y `Qbar` (acumuladas).
 
-### Paso 5
+### Paso 5. Loop de entrenamiento
 
-Durante cada batch:
+Por cada batch:
 
 * samplear `t`
 * corromper `z0` → `zt`
 * pasar `zt` por el modelo
 * calcular `VB + aux`
-* hacer backpropagation
+* backpropagation
 
-### Paso 6
+### Paso 6. Guardar checkpoint
 
-Guardar checkpoint.
+### Paso 7. Unconditional sampling para inspección
 
-### Paso 7
+## Posibles errores durante el entrenamiento
 
-Probar unconditional sampling.
-
-## Resultado
-
-El resultado del entrenamiento es un modelo que puede generar secuencias discretas de layouts.
+| Error | Causa |
+|---|---|
+| Mapeo equivocado de datos | Pérdida de trazabilidad `screen_id` ↔ row |
+| Flatten/interleave incorrecto | El orden de tokens no coincide con lo esperado por el modelo |
+| Dataset con mucho ruido | Demasiados layouts atípicos en train |
+| `M` mal elegido | Demasiado truncamiento o demasiado padding |
+| Cuantización inadecuada | Bins no capturan bien la distribución geométrica |
 
 ---
 
-# 9. Estado en que quedó el sistema
+# 11. Estado actual del proyecto
 
 ## Ya resuelto
 
-* entendimos la estructura de RICO
-* implementamos el parser
-* entendimos el formato requerido por LayoutDM
-* definimos el pipeline de preprocesamiento
-* generamos el script de exportación de tokens
-* implementamos el training loop mínimo
-* implementamos unconditional sampling
+* parser funcional para la mayoría del dataset (66 195 / 66 261 pantallas)
+* manejo de archivos dañados con warning en lugar de crash
+* cálculo razonable de `M = 55` (p95)
+* split reproducible (52 956 / 6 619 / 6 620)
+* vocabulario de 25 categorías desde train
+* discretización KMeans train-only con BINS = 64
+* exportación de tokens y metadata
+* validación de shapes, dtype y vocabulario
+* diagnóstico correcto del bug de correspondencia índice ↔ pantalla
+* implementación del training loop mínimo con VB + aux loss
+* implementación de unconditional sampling
 
 ## Pendiente para una réplica más fiel
 
-* usar el schedule exacto del paper
-* añadir shuffle por sample
-* validar visualmente el decoding de layouts
+* guardar `ids_train/val/test.json` en el builder
+* usar el schedule exacto del paper (reemplazar `make_transition_params()`)
+* añadir shuffle por sample en el Dataset
+* validar visualmente los overlays usando `screen_id` como clave
 * comparar métricas con el paper
 
 ---
 
-# 10. Resumen final simple
+# 12. Recomendaciones prácticas para continuar
 
-Si lo resumimos en una sola cadena de pasos:
+1. **Guardar siempre los ids por split** (`ids_train.json`, `ids_val.json`, `ids_test.json`) para poder hacer debug por `screen_id`.
+2. **Guardar `bad_files.json`** para saber qué pantallas quedaron fuera del pipeline.
+3. **Construir el script de debug por `screen_id`**, no por índice posicional en el tensor.
+4. **Validar overlays** con: caja real (rojo), caja reconstruida (verde), error absoluto por `x,y,w,h`.
+5. **Revisar 20-50 ejemplos** antes de entrenar a gran escala: distribución de conteos, comportamiento del padding, coherencia de categorías.
+6. **Ejecutar el preprocesamiento completo** sobre RICO real, revisar las estadísticas de `M` y arrancar con un modelo pequeño.
+
+---
+
+# 13. Conclusión
+
+Se logró construir y depurar el pipeline completo de **RICO → tokens discretos para LayoutDM**.
+
+Lo más importante que descubrimos fue que:
+
+* el preprocesamiento en sí estaba funcionando razonablemente bien,
+* pero la inspección visual inicial usaba rows equivocados del tensor,
+* lo que generaba una falsa impresión de mala alineación.
+
+La depuración mostró que para trabajar correctamente con LayoutDM no basta con generar tokens: también hay que garantizar una trazabilidad precisa entre archivo fuente, split, posición del tensor y reconstrucción visual.
+
+Con eso resuelto, el siguiente paso natural es conectar estos tokens al entrenamiento de LayoutDM, validar muestras generadas y seguir depurando la calidad de generación.
+
+---
+
+# 14. Resumen final simple
 
 ### Preprocesamiento
 
-`RICO JSON -> parse tree -> flatten elements -> normalize xywh -> split -> KMeans train-only -> discretize -> pad -> tokens.pt`
+```
+RICO JSON
+  → parse tree (66195 screens válidas)
+  → flatten elements
+  → normalize xywh (snapping a resolución canónica RICO)
+  → split 80/10/10 (solo sobre screens parseables)
+  → KMeans 1D train-only (BINS=64)
+  → discretize
+  → pad hasta M=55
+  → tokens.pt [N, 55, 5]
+```
 
 ### Entrenamiento
 
-`tokens.pt -> diffusion corruption -> Transformer denoiser -> VB + aux -> reverse sampling`
+```
+tokens.pt → diffusion corruption (modality-wise) → Transformer denoiser → VB + aux → reverse sampling
+```
 
 ### Resultado final
 
@@ -700,29 +702,44 @@ Un modelo que aprende a generar layouts en formato:
 (c_id, x_id, y_id, w_id, h_id)
 ```
 
-y que luego puede decodificarse a cajas geométricas reales.
+decodificable a cajas geométricas reales usando los centroides KMeans.
 
 ---
 
-# 11. Recomendación práctica de continuación
+# Anexo A: Dataset mínimo para entrenamiento
 
-El siguiente paso más razonable es este:
+```python
+import os, json, torch
+from torch.utils.data import Dataset
 
-1. ejecutar el script de preprocesamiento completo sobre RICO
-2. revisar estadísticas reales de `M`
-3. entrenar un modelo pequeño
-4. decodificar y renderizar algunas muestras
-5. validar si la geometría se ve coherente antes de seguir con métricas o constraints
+class LayoutTokensDataset(Dataset):
+    def __init__(self, tokens_path, vocab_meta_path):
+        self.tokens = torch.load(tokens_path)
+        with open(vocab_meta_path, "r", encoding="utf-8") as f:
+            self.meta = json.load(f)
+
+    def __len__(self):
+        return self.tokens.shape[0]
+
+    def __getitem__(self, idx):
+        return {"tokens": self.tokens[idx]}
+```
 
 ---
 
-Si quieres, en el siguiente mensaje te lo convierto en una versión más “documento técnico” con secciones tipo:
+# Anexo B: Exportar ids por split en el builder
 
-* Introducción
-* Arquitectura
-* Pipeline de datos
-* Entrenamiento
-* Riesgos y validaciones
-* Próximos pasos
+```python
+# Al final de main(), añadir:
+with open(os.path.join(OUT_DIR, "ids_train.json"), "w", encoding="utf-8") as f:
+    json.dump([s["id"] for s in train_screens], f, indent=2)
 
-o te lo separo en dos archivos `.md`: uno para **preprocesamiento** y otro para **entrenamiento**.
+with open(os.path.join(OUT_DIR, "ids_val.json"), "w", encoding="utf-8") as f:
+    json.dump([s["id"] for s in val_screens], f, indent=2)
+
+with open(os.path.join(OUT_DIR, "ids_test.json"), "w", encoding="utf-8") as f:
+    json.dump([s["id"] for s in test_screens], f, indent=2)
+
+with open(os.path.join(OUT_DIR, "bad_files.json"), "w", encoding="utf-8") as f:
+    json.dump(bad, f, indent=2)
+```
