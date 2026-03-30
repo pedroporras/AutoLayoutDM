@@ -1,16 +1,18 @@
-# Resumen de implementación de LayoutDM con RICO
+# Resumen completo del trabajo realizado con RICO → LayoutDM
 
 ## 1. Objetivo general
 
-La meta de todo este trabajo fue entender **LayoutDM** como si fuera un sistema de ingeniería y no como un paper académico.
+La meta de todo este trabajo fue entender **LayoutDM** como si fuera un sistema de ingeniería y no como un paper académico, y construir un pipeline completo para usar el dataset **RICO semantic annotations** como entrada.
 
 La idea central es esta:
 
 * tenemos un dataset de interfaces (`RICO`)
 * extraemos de cada pantalla una lista de elementos visuales
 * convertimos esos elementos a una representación estructurada
-* discretizamos esa representación
+* discretizamos esa representación a tokens
+* exportamos esos tokens para entrenamiento
 * entrenamos un modelo de **diffusion discreto** para generar layouts
+* depuramos problemas como solapamientos, alineaciones raras o salidas incoherentes
 
 En otras palabras:
 
