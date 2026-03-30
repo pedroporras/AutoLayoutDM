@@ -69,6 +69,8 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es/).
 
 ## [Preprocessing iter 1 — layoutdm_preprocesamiento.py] — anterior a iter 4
 
+Nota: Esta primera iteracion presenta un problema, hay un error en el indexado entre el preprocesamiento y los ejemplos que se toman para el mapeo del layout
+
 ### Añadido
 - Script `layoutdm_preprocesamiento.py` (base del pipeline de preprocesamiento):
   - `_walk_nodes`: recorrido pre-order del árbol de UI de RICO.
