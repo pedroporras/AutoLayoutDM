@@ -488,13 +488,9 @@ El problema residual ya no apunta a la estructura de datos ni al proceso forward
 
 ## 10.7. Sospechosos actuales de la baja calidad
 
-### a. Reverse sampling posiblemente mal calibrado
+### a. ~~Reverse sampling mal calibrado~~ — corregido en iter4
 
-Es ahora el sospechoso más fuerte. Muchos blueprints simplificados fallan aquí porque:
-
-* usan una aproximación ingenua del posterior `q(z_{t-1} | z_t, z_0)`,
-* no reconstruyen bien `z_{t-1}` paso a paso,
-* o tratan incorrectamente `PAD` y `MASK` durante el sampling.
+En iter3 el sospechoso principal era el sampling inverso: se muestreaba directamente desde `F.softmax(logits[m])` = `p_theta(z_0|z_t)`, ignorando la cadena markoviana. Desde iter4 se usa `compute_theta_posterior` que marginaliza correctamente para obtener `p_theta(z_{t-1}|z_t)` antes de samplear. Este bloqueo está resuelto.
 
 ### b. `q_sample()` no validado en la práctica
 
@@ -675,27 +671,31 @@ Esta sección documenta el código del entrenador, explica cada componente, las 
 
 El entrenador tiene tres iteraciones. Cada una resolvió un conjunto distinto de problemas:
 
-| | Iter1 (blueprint inicial) | Iter2 | Iter3 (versión actual) |
-|---|---|---|---|
-| **Datos** | Dataset dummy — tokens aleatorios en memoria | Datos reales de RICO (`tokens_*.pt`) | Datos reales de RICO |
-| **`pad_mask`** | Un único `pad_id` global | `pad_id` por modalidad con broadcast | Sin cambios |
-| **`M`** | Hardcodeado a `25` | Leído desde `vocab_meta.json` | Sin cambios |
-| **Shuffle** | No implementado | `_shuffle_valid_elements()` | Sin cambios |
-| **Decode / render** | No incluido | `decode_layout()` + `render_layout()` + grid de validación | Sin cambios |
-| **Checkpoint** | Solo `model_state` | `model_state` + `cfg.__dict__` + `vocab_meta` | Sin cambios |
-| **`forward()` flatten** | Por bloques `[c1..cM, x1..xM,...]` (bug) | Por bloques (bug persistía) | **Intercalado** `[c1,x1,y1,w1,h1,...]` ✅ |
-| **`categorical_sample`** | Stub vacío | Stub vacío | **Implementada** ✅ |
-| **`compute_losses`** | Stub vacío | Stub vacío | **Implementada** con métricas desagregadas ✅ |
-| **`train_one_epoch`** | Stub vacío | Stub vacío | **Implementada** con logging cada 50 pasos ✅ |
-| **`unconditional_sample`** | Stub vacío | Stub vacío | **Implementada** con regla de coherencia PAD ✅ |
-| **Caso borde `t=1`** | No manejado | No manejado | `Qbars_prev = torch.eye(V)` explícito ✅ |
-| **`precompute_Q_mats`** | Dicts `{t: Qt}` | Dicts `{t: Qt}` | **Listas** `[Qt_1..Qt_T]` con offset `[t-1]` ✅ |
+| | Iter1 (blueprint inicial) | Iter2 | Iter3 | Iter4 (versión actual) |
+|---|---|---|---|---|
+| **Datos** | Dataset dummy — tokens aleatorios en memoria | Datos reales de RICO (`tokens_*.pt`) | Sin cambios | Sin cambios |
+| **`pad_mask`** | Un único `pad_id` global | `pad_id` por modalidad con broadcast | Sin cambios | Sin cambios |
+| **`M`** | Hardcodeado a `25` | Leído desde `vocab_meta.json` | Sin cambios | Sin cambios |
+| **Shuffle** | No implementado | `_shuffle_valid_elements()` | Sin cambios | Sin cambios |
+| **Decode / render** | No incluido | `decode_layout()` + `render_layout()` + grid de validación | Sin cambios | Sin cambios |
+| **Checkpoint** | Solo `model_state` | `model_state` + `cfg.__dict__` + `vocab_meta` | Sin cambios | Sin cambios |
+| **`forward()` flatten** | Por bloques `[c1..cM, x1..xM,...]` (bug) | Por bloques (bug persistía) | **Intercalado** `[c1,x1,y1,w1,h1,...]` ✅ | Sin cambios |
+| **`categorical_sample`** | Stub vacío | Stub vacío | **Implementada** ✅ | Sin cambios |
+| **`compute_theta_posterior`** | No existía | No existía | No existía | **Implementada** (Eq. 3 LayoutDM) ✅ |
+| **`compute_losses` — p_model** | Stub | Stub | `F.softmax(logits)` directo (bug: distribución sobre `z_0`, no sobre `z_{t-1}`) | `compute_theta_posterior(...)` — distribución sobre `z_{t-1}` ✅ |
+| **`train_one_epoch`** | Stub vacío | Stub vacío | **Implementada** con logging cada 50 pasos ✅ | Sin cambios |
+| **`unconditional_sample`** — sampling | Stub vacío | Stub vacío | `F.softmax` directo (muestreo desde `p(z_0\|z_t)`, incorrecto) | `compute_theta_posterior` → `torch.multinomial` ✅ |
+| **Caso borde `t=1`** | No manejado | No manejado | `Qbars_prev = torch.eye(V)` explícito ✅ | Sin cambios |
+| **`precompute_Q_mats`** | Dicts `{t: Qt}` | Dicts `{t: Qt}` | **Listas** `[Qt_1..Qt_T]` con offset `[t-1]` ✅ | Sin cambios |
+| **`main()` retorno** | — | `(model, cfg, train_ds, val_ds, vocab_meta)` | `(model, cfg, train_ds, val_ds, vocab_meta)` | **Añade `Qts_all, Qbars_all`** para reusar en celdas interactivas ✅ |
 
 **Iter1**: válido solo para comprobar que las matemáticas del proceso de difusión no crashearan. Cualquier generación era ruido sobre ruido — no tenía ninguna conexión con RICO.
 
 **Iter2**: conecta el entrenador con artefactos reales. El pipeline completo ya corría, pero las funciones críticas (`forward`, `compute_losses`, `train_one_epoch`, `unconditional_sample`) seguían siendo stubs vacíos.
 
-**Iter3**: implementa todas las funciones pendientes. Es la primera versión del entrenador que entrena y genera layouts de forma funcional y completa.
+**Iter3**: implementa todas las funciones pendientes. Es la primera versión del entrenador que entrena y genera layouts de forma funcional. Sin embargo, tanto `compute_losses` como `unconditional_sample` cometían el mismo error: usaban `F.softmax(logits)` directamente como modelo de `p_theta(z_{t-1}|z_t)`, cuando en realidad eso es `p_theta(z_0|z_t)` — distribuciones sobre vocabularios distintos en el KL y sampling incorrecto en la cadena inversa.
+
+**Iter4**: corrige el error de distribución en ambas funciones añadiendo `compute_theta_posterior`, que implementa la marginalización VQ-Diffusion (LayoutDM Eq. 3). Es la primera versión con el sampling inverso matemáticamente correcto.
 
 ---
 
@@ -883,6 +883,39 @@ $$q(z_{t-1} \mid z_t, z_0) \propto q(z_t \mid z_{t-1}) \cdot q(z_{t-1} \mid z_0)
 
 ---
 
+## 14.7b. `compute_theta_posterior` — la marginalización VQ-Diffusion (añadida en iter4)
+
+```python
+def compute_theta_posterior(
+    p_theta_z0: torch.Tensor,  # [B, M, V]  p(z_0 | z_t) del modelo
+    zt_m: torch.Tensor,        # [B, M]     tokens ruidosos en el paso t
+    Qt: torch.Tensor,          # [V, V]     matriz de transición Qt
+    Qbar_t1: torch.Tensor,     # [V, V]     Qbar_{t-1} acumulada
+) -> torch.Tensor:             # [B, M, V]  p_theta(z_{t-1} | z_t)
+    p_z1_marginal = torch.matmul(p_theta_z0, Qbar_t1)       # [B, M, V]
+    Qt_col = Qt[:, zt_m].permute(1, 2, 0).contiguous()      # [B, M, V]
+    unnorm = Qt_col * p_z1_marginal                          # [B, M, V]
+    return unnorm / (unnorm.sum(dim=-1, keepdim=True) + 1e-12)
+```
+
+Implementa la fórmula central de VQ-Diffusion / LayoutDM (Eq. 3):
+
+$$p_\theta(z_{t-1}=v \mid z_t=s) \propto Q_t[v, s] \cdot \sum_u \left[ p_\theta(z_0=u \mid z_t) \cdot \bar{Q}_{t-1}[u, v] \right]$$
+
+**Por qué esta función era el bug principal de iter3**: tanto `compute_losses` como `unconditional_sample` usaban `F.softmax(logits[m])` directamente como representación del modelo. Eso es `p_theta(z_0 | z_t)` — una distribución sobre el vocabulario de `z_0`. Al calcular KL contra `q_posterior_true(z0, zt)` (que es una distribución sobre `z_{t-1}`), los vectores tenían la misma dimensión de vocabulario pero semántica completamente distinta. Formalmente, el KL no tenía sentido matemático.
+
+**`p_z1_marginal = p_theta_z0 @ Qbar_t1`**: marginaliza sobre `z_0`:  
+$$\sum_u p_\theta(z_0=u \mid z_t) \cdot \bar{Q}_{t-1}[u, v]$$  
+Convierte la distribución sobre `z_0` en una distribución sobre `z_{t-1}` ponderada por la probabilidad de transición acumulada.
+
+**`Qt_col = Qt[:, zt_m].permute(1,2,0)`**: para cada posición, extrae la columna `zt_m` de `Qt`, es decir `Q_t[v, z_t]` — la probabilidad de que el token en `t` fuera `z_t` viniendo de `v` en `t-1`. Idéntico al indexado de `q_posterior_true`, pero aquí sobre la distribución del modelo.
+
+**Usada en dos lugares**:
+- `compute_losses`: como `p_model` en el KL — ahora comparamos `q(z_{t-1}|z_t,z_0)` vs `p_theta(z_{t-1}|z_t)`, ambas sobre `z_{t-1}`. ✅
+- `unconditional_sample`: como distribución de muestreo en cada paso de denoising — el modelo ahora recorre correctamente `p_theta(z_{t-1}|z_t)`. ✅
+
+---
+
 ## 14.8. `LayoutDMDenoiser` — el modelo Transformer
 
 ### Por qué Transformer encoder (no decoder)
@@ -984,6 +1017,8 @@ def compute_losses(cfg, logits, z0, zt, t, Qts_t, Qbars_prev, pad_mask):
 
 Minimiza el KL entre el posterior verdadero `q(z_{t-1} | z_t, z_0)` y la distribución predicha por el modelo `p_θ(z_{t-1} | z_t)`. Este es el objetivo principal del paper — el modelo aprende a aproximar la reversión del proceso forward.
 
+**Corrección iter4**: en iter3, `p_model = F.softmax(logits[m])` era `p_theta(z_0 | z_t)`, no `p_theta(z_{t-1} | z_t)`. El KL estaba calculando divergencia entre distribuciones que se referían a variables distintas (`z_{t-1}` vs `z_0`), aunque compartieran dimensión de vocabulario. Desde iter4, `p_model = compute_theta_posterior(p_theta_z0, zt_m, Qt, Qbar_prev)`, que produce correctamente `p_theta(z_{t-1} | z_t)`. 
+
 ### Aux loss (pérdida auxiliar)
 
 Cross-entropy para reconstruir directamente `z_0` desde los logits. No está fundamentada en la formulación probabilística estricta, pero aporta una señal de entrenamiento más directa que estabiliza el aprendizaje, especialmente en los primeros pasos cuando el modelo no ha aprendido nada todavía.
@@ -1055,14 +1090,23 @@ for a, m in enumerate(modalities):
     zt[:, :, a] = mask_ids[m]
 
 for t in range(cfg.T, 0, -1):
-    logits = model(zt)   # m -> [B, M, V_m]
+    logits = model(zt)   # m -> [B, M, V_m]  predice p(z_0 | z_t)
     z_prev = zt.clone()
 
     for a, m in enumerate(modalities):
-        probs   = F.softmax(logits[m], dim=-1)           # [B, M, V]
-        sampled = torch.multinomial(
-            probs.reshape(-1, probs.size(-1)), 1
-        ).squeeze(-1).view(B, M)
+        p_theta_z0 = F.softmax(logits[m], dim=-1)          # [B, M, V]  p(z_0 | z_t)
+
+        Qt = Qts_all[m][t - 1]
+        if t == 1:
+            Qbar_prev = torch.eye(vocab_meta[m]["vocab_size"], device=device)
+        else:
+            Qbar_prev = Qbars_all[m][t - 2]
+
+        # Posterior p_theta(z_{t-1}|z_t) via VQ-Diffusion Eq. 3
+        probs = compute_theta_posterior(p_theta_z0, zt[:, :, a], Qt, Qbar_prev)  # [B, M, V]
+
+        flat = probs.reshape(-1, probs.size(-1))
+        sampled = torch.multinomial(flat, 1).squeeze(-1).view(B, M)
         z_prev[:, :, a] = sampled
 
     # Regla de coherencia PAD: si c==PAD, forzar x/y/w/h a PAD
@@ -1080,11 +1124,9 @@ return zt  # z_0
 
 **Por qué iniciar en `[MASK]`**: el proceso forward lleva `z_0 → z_T` donde `z_T` es casi todo `[MASK]`. El sampling reverso debe partir de ese mismo estado.
 
-**Sampling directo desde los logits**: en cada paso `t` se samplea `z_{t-1}` directamente desde la distribución predicha por el modelo. No se usa el posterior verdadero `q(z_{t-1} | z_t, z_0)` porque en inferencia no se conoce `z_0` — eso es exactamente lo que se quiere generar.
+**Corrección iter4 — sampling via `compute_theta_posterior`**: en iter3 se samplea directamente desde `F.softmax(logits[m])`, que es `p_theta(z_0 | z_t)`. En la cadena de denoising el modelo genera `z_{t-1}`, no `z_0` directamente. Usar `p(z_0|z_t)` como distribución de muestreo equivale a saltar directamente del paso `t` al paso `0` ignorando la estructura de la cadena markoviana. Desde iter4 se usa `compute_theta_posterior`, que marginaliza correctamente para obtener `p_theta(z_{t-1} | z_t)` antes de muestrear.
 
 **`torch.where` por atributo** (no `z_prev[:, :, 1:]` en bloque): la regla de coherencia se aplica atributo a atributo porque cada modalidad tiene su propio `pad_id`. Un `torch.where` sobre un slice `[:, :, 1:]` mezclaría los `pad_id` de `x`, `y`, `w` y `h` con el mismo valor, lo que sería incorrecto si `BINS` cambia entre modalidades.
-
-**Sospechoso principal de baja calidad**: el sampling directo desde logits ignora la estructura del posterior `q(z_{t-1} | z_t, z_0)`. Una implementación más fiel al paper usaría los logits para obtener `p(z_0 | z_t)` y luego marginalizaría sobre el posterior verdadero.
 
 ---
 
@@ -1097,12 +1139,14 @@ return zt  # z_0
 | `Qbar_t` precalculada | Costosa de calcular en cada step; estable en memoria para T=100 |
 | Listas con offset `[t-1]` en lugar de dict `{t: Qt}` | Más idiomático en Python; el caso borde `t=1` se maneja explícitamente con `torch.eye` |
 | Flatten `stack + reshape` intercalado | Permite al Transformer atender a categoría y geometría del mismo elemento |
+| `compute_theta_posterior` para `p_model` y sampling | Transforma `p_theta(z_0\|z_t)` en `p_theta(z_{t-1}\|z_t)` — distribución correcta para KL y denoising |
 | Aux loss con CE | Señal más directa que estabiliza el entrenamiento, peso pequeño `lambda=0.1` |
 | `valid` mask en la pérdida | PAD no debe contribuir a la señal de gradiente |
 | Regla de coherencia PAD en sampling | Evita generar geometría en posiciones vacías |
 | `torch.where` por atributo en coherencia PAD | Cada modalidad tiene su propio `pad_id` — un slice en bloque usaría el valor equivocado |
+| `main()` retorna `Qts_all, Qbars_all` | Permite reusar las matrices precalculadas en celdas Colab posteriores sin recomputar |
 
-## 14.13. Qué ya funciona (iter3)
+## 14.13. Qué ya funciona (iter4)
 
 * carga `tokens_*.pt` reales desde disco ✅
 * lee `vocab_meta.json` y usa `M` real desde artefactos ✅
@@ -1110,9 +1154,11 @@ return zt  # z_0
 * `_shuffle_valid_elements`: shuffle solo de elementos reales, PAD tail intacto ✅
 * positional encodings desacoplados (`elem_pos` + `attr_pos`) ✅
 * `forward()` con flatten intercalado `stack([c,x,y,w,h], dim=2).reshape(B, 5M, D)` ✅
-* `compute_losses` completa con VB (KL) + aux (CE), máscara `valid`, métricas desagregadas ✅
+* `compute_theta_posterior`: marginalización VQ-Diffusion/LayoutDM Eq. 3 ✅
+* `compute_losses` completa con VB (KL) correcto entre `q(z_{t-1}|z_t,z_0)` y `p_theta(z_{t-1}|z_t)`, aux (CE), máscara `valid`, métricas desagregadas ✅
 * `categorical_sample` implementada ✅
-* `unconditional_sample` implementada con regla de coherencia PAD por `torch.where` ✅
+* `unconditional_sample` implementada con posterior correcto `compute_theta_posterior → torch.multinomial` ✅
+* regla de coherencia PAD en sampling (`torch.where` por atributo) ✅
 * `train_one_epoch` completa con logging cada 50 pasos ✅
 * caso borde `t=1` manejado con `torch.eye(V)` ✅
 * schedule matemáticamente consistente ✅
@@ -1120,15 +1166,16 @@ return zt  # z_0
 * ejecuta entrenamiento end-to-end sin errores ✅
 * guarda checkpoint con `cfg`, `model_state` y `vocab_meta` ✅
 * genera muestras renderizables ✅
+* `main()` retorna `Qts_all, Qbars_all` para uso interactivo en Colab ✅
 
 ## 14.14. Qué sigue pendiente de validar / mejorar
 
 | Componente | Estado |
 |---|---|
 | `q_sample_from_Qbar` | No validada visualmente — comprobar que la degradación sea gradual: casi intacta para `t` pequeño, casi todo `MASK` para `t=T` |
-| Reverse sampling | El sampling directo desde logits es una simplificación — no usa el posterior verdadero `q(z_{t-1} \| z_t, z_0)`; sospechoso principal de baja calidad visual |
-| Schedule forward | La curva seno es aproximada, no el schedule exacto del paper — pendiente validar contra implementación oficial de `CyberAgentAILab/layout-dm` |
-| Epochs de entrenamiento | Con todas las correcciones activas, reentrenar una corrida más larga y comparar visualmente contra iter2 |
+| Schedule forward | La curva seno es una aproximación razonablemente fiel pero no idéntica al paper — pendiente validar contra implementación oficial de `CyberAgentAILab/layout-dm` |
+| Filtrado de RICO | Sin whitelist de categorías ni NMS, el dataset incluye elementos ruidosos que pueden perjudicar la calidad estructural del layout generado |
+| Epochs de entrenamiento | Con todas las correcciones activas (iter4), reentrenar una corrida más larga y evaluar visualmente si los layouts mejoran respecto a iter3 |
 
 ## Cómo se prueba el resultado
 

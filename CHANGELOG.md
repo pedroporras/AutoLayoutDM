@@ -5,6 +5,34 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es/).
 
 ---
 
+## [Trainer iter 4 — layoutdm_trainer.py] — 2026-03-30
+
+### Corregido
+- **Bug principal de iter3: `unconditional_sample` usaba direct softmax sampling en lugar del posterior verdadero.**  
+  En iter3, el muestreo inverso obtenía `probs = F.softmax(logits[m], dim=-1)` directamente, lo que equivalía a muestrear desde `p_theta(z_0 | z_t)` en lugar de desde `p_theta(z_{t-1} | z_t)`. El modelo no retrocedía correctamente por el proceso de difusión.  
+  **Fix**: ahora se usa `compute_theta_posterior(p_theta_z0, zt[:,:,a], Qt, Qbar_prev)` para obtener la distribución marginalizada correcta antes de muestrear.
+
+- **`compute_losses` usaba el softmax crudo del modelo como `p_model` en el KL.**  
+  En iter3 la VB loss calculaba KL entre `q_posterior_true(z0,zt)` y `F.softmax(logits)`, es decir comparaba `q(z_{t-1}|z_t,z_0)` (sobre `z_{t-1}`) contra `p_theta(z_0|z_t)` (sobre `z_0`), que son distribuciones sobre vocabularios distintos. El KL no era coherente.  
+  **Fix**: `p_model` se calcula ahora como `compute_theta_posterior(p_theta_z0, zt_m, Qt, Qbar_prev)`, produciendo `p_theta(z_{t-1}|z_t)` sobre el mismo espacio que `q_posterior_true`. El KL es ahora matemáticamente correcto.
+
+### Añadido
+- **`compute_theta_posterior(p_theta_z0, zt_m, Qt, Qbar_t1)`** — implementación de la marginalización VQ-Diffusion (LayoutDM Eq. 3 / VQ-Diffusion Eq. 7):
+  ```
+  p_theta(z_{t-1}=v | z_t=s)  ∝  Qt[v,s]  *  (p_theta_z0 @ Qbar_{t-1})[v]
+  ```
+  - `p_z1_marginal = p_theta_z0 @ Qbar_t1`  → `[B, M, V]`
+  - `Qt_col = Qt[:, zt_m].permute(1,2,0)` → `[B, M, V]`
+  - `unnorm = Qt_col * p_z1_marginal` → normalizado con `+1e-12`
+  - Usada tanto en `compute_losses` (lado modelo del KL) como en `unconditional_sample` (sampling inverso).
+
+### Modificado
+- `unconditional_sample`: reemplaza el flujo de sampling por `compute_theta_posterior → torch.multinomial`, coherente con el entrenamiento. El sampling ahora recorre correctamente `p_theta(z_{t-1}|z_t)` en cada paso de denoising.
+- `compute_losses`: `p_model` ahora se construye vía `compute_theta_posterior`; el KL se calcula entre `q_posterior_true` (verdadero) y `p_theta(z_{t-1}|z_t)` (modelo), ambos sobre el vocabulario de `z_{t-1}`.
+- `main()`: retorna `Qts_all, Qbars_all` adicionalmente a `(model, cfg, train_ds, val_ds, vocab_meta)` para reusar las matrices precalculadas en celdas interactivas sin recomputar.
+
+---
+
 ## [Trainer iter 3 — layoutdm_trainer.py] — 2026-03-30
 
 ### Corregido
