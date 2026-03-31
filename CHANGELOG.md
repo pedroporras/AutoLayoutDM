@@ -5,6 +5,43 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es/).
 
 ---
 
+## [Trainer iter 3 — layoutdm_trainer.py] — 2026-03-30
+
+### Corregido
+- **Bug crítico: `forward()` usaba flatten por bloques de modalidad en lugar de secuencia intercalada por elemento.**  
+  En iter2, `torch.cat(reps, dim=1)` producía una secuencia `[c1..cM, x1..xM, y1..yM, w1..wM, h1..hM]` donde el Transformer veía primero todas las categorías juntas y luego todas las posiciones; nunca podía atender a la categoría y la geometría del **mismo** elemento en la misma ventana de atención.  
+  **Fix**: ahora se usa `torch.stack([c_all, x_all, y_all, w_all, h_all], dim=2)` → `reshape(B, M*5, D)` para obtener la secuencia intercalada `[c1,x1,y1,w1,h1, c2,x2,y2,w2,h2, ...]`. El desaplanado de vuelta usa `h.reshape(B, M, 5, D)` con extracción explícita por índice de atributo.
+
+- **Caso borde `t=1` en `Qbars_prev`:** cuando `t==1`, `Qbar_{t-1}` debe ser la matriz identidad (`q(z_0|z_0)=I`). En iter2 esto no estaba manejado explícitamente y podría producir un índice negativo `[t-2]=-1`. Ahora se construye `torch.eye(V)` explícitamente para `t==1`.
+
+- **Validación de rango de `t`:** se añade `if not (1 <= t <= cfg.T): raise ValueError(...)` para detectar tempranamente cualquier error de off-by-one en el muestreo del timestep.
+
+### Añadido
+- **`categorical_sample` implementada:**
+  ```python
+  flat = probs.reshape(-1, probs.size(-1))
+  out  = torch.multinomial(flat, num_samples=1).squeeze(-1)
+  return out.view(probs.shape[:-1])
+  ```
+  Era un stub vacío en iter2.
+
+- **`LayoutDMDenoiser.forward()` completamente implementado:** embeddings por modalidad con `elem_pos + attr_pos`, flatten intercalado (corrección del bug de iter2), Transformer encoder, unflatten `[B, M, 5, D]`, extracción explícita de `h_c, h_x, h_y, h_w, h_h`, head por modalidad → logits `[B, M, V_m]`.
+
+- **`compute_losses()` completamente implementado:** produce `q_posterior_true()` para la VB loss (KL), `F.softmax` para la distribución del modelo, `F.cross_entropy` para la aux loss, máscara `valid = ~pad_mask` normalizada por `valid.sum().clamp_min(1.0)`. Retorna `(total_loss, metrics_dict)` con `loss_total`, `loss_vb` y `loss_aux` desagregados como floats para logging.
+
+- **`train_one_epoch()` completamente implementado:** transfiere tensores a device, muestrea `t` uniforme en `[1, T]`, construye `zt` por modalidad via `q_sample_from_Qbar`, maneja el caso `t==1` con identidad para `Qbars_prev`, llama a `compute_losses`, hace `backward/step`. Logging de progreso cada 50 pasos:  
+  `step=0050 t=042 loss=1.2345 vb=1.1234 aux=0.1111`
+
+- **`unconditional_sample()` completamente implementado:** inicializa `z_T` con tokens `[MASK]` por modalidad, itera `t=T..1` con `model(zt) → softmax → multinomial`, aplica la **regla de coherencia PAD** con `torch.where` explícito para cada atributo geométrico: si `c == PAD`, fuerza `x/y/w/h` al PAD correspondiente.
+
+- **`main()` con logging por epoch:** `print(f"\n=== Epoch {ep+1}/{epochs} ===")` antes de cada llamada a `train_one_epoch`.
+
+### Modificado
+- `precompute_Q_mats`: almacena las matrices en **listas** (`Qts_all[m] = list`, `Qbars_all[m] = list`) en lugar de diccionarios. La indexación usa offset: `Qts_all[m][t-1]`, `Qbars_all[m][t-1]`, `Qbars_all[m][t-2]`.
+- `main()`: retorna explícitamente `(model, cfg, train_ds, val_ds, vocab_meta)` para uso interactivo en el notebook Colab.
+
+---
+
 ## [Trainer iter 2 — layoutdm_trainer.py] — 2026-03-30
 
 ### Corregido
