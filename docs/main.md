@@ -650,53 +650,402 @@ Si renderizas `tokens_val.pt` reales y los layouts se ven plausibles, el preproc
 
 ---
 
-# 14. Explicación separada: Entrenamiento del modelo
+# 14. Implementación del entrenador: `layoutdm_trainer.py`
 
-## Arquitectura del denoiser
+Esta sección documenta el código del entrenador, explica cada componente, las decisiones de diseño tomadas y los puntos que aún requieren corrección.
 
-### 1. Embeddings por modalidad
+---
 
-Cada token discreto se convierte en embedding: `c_embed`, `x_embed`, `y_embed`, `w_embed`, `h_embed`, produciendo tensores `[B, M, D]` por modalidad.
+## 14.1. Filosofía general del diseño
 
-### 2. Positional encodings desacoplados
+El entrenador está pensado para **claridad sobre velocidad**. Cada componente es independiente y razonable por sí solo — fue diseñado para poder depurar cada pieza en aislamiento y verificar que las matemáticas fueran correctas antes de preocuparse por eficiencia.
 
-Se usan dos tipos de embeddings posicionales:
+Las restricciones que guiaron el diseño:
 
-* **posición de elemento**: qué elemento es dentro del layout
-* **posición de atributo**: qué modalidad es dentro del elemento
+* seguir lo más fielmente posible las ecuaciones del paper de LayoutDM
+* no usar ninguna abstracción que oscureciera la matemática del proceso de difusión
+* que cualquier fallo fuera observable directamente con un `print` o una inspección visual
 
-Esto permite que el Transformer represente mejor la estructura bidimensional `(elemento, atributo)`.
+---
 
-### 3. Flatten intercalado
+## 14.2. `TrainConfig` — configuración global
 
-Los embeddings se reorganizan en secuencia intercalada `[B, 5M, D]` antes de entrar al Transformer. Ver sección 8.4 para detalle.
+```python
+@dataclass
+class TrainConfig:
+    T: int = 100           # pasos de difusión
+    lambda_aux: float = 0.1
+    lr: float = 5e-4
+    n_layers: int = 4
+    n_heads: int = 8
+    d_model: int = 512
+    d_ff: int = 2048
+    M: int = 25
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+```
 
-### 4. Transformer encoder
+**Por qué `@dataclass`**: permite construir el config como objeto tipado, pasarlo a funciones y serializarlo en el checkpoint sin fricción (`cfg.__dict__`).
 
-Procesa la secuencia completa sin autoregresión. LayoutDM modela el layout completo de forma paralela.
+**`T = 100`**: valor exacto del paper. El schedule va de `t=1` (corrupción mínima) a `t=T` (casi todo enmascarado).
 
-### 5. Heads por modalidad
+**`lambda_aux = 0.1`**: peso de la pérdida auxiliar, tomado directamente de la Ecuación 4 del paper. Sin esta pérdida el entrenamiento es inestable.
 
-Para cada modalidad hay una proyección lineal al tamaño de su vocabulario: `[B, M, V_m]`.
+**`M = 25`**: valor de inicio para depuración. El valor real calculado desde RICO es `M = 55` (p95). Se usó `25` para reducir el espacio de error durante la fase de depuración inicial.
 
-## Qué ya funciona
+---
+
+## 14.3. `LayoutTokenDataset` — acceso a los datos
+
+```python
+class LayoutTokenDataset(Dataset):
+    def __getitem__(self, idx):
+        tokens = self.x[idx]
+        pad_mask = (tokens == self.pad_id)
+        return tokens, pad_mask
+```
+
+**Por qué `pad_mask` se calcula aquí**: se necesita saber qué posiciones son PAD en todas las funciones de pérdida. Si se calculara en otro sitio habría riesgo de inconsistencia. Al generarlo en el Dataset, siempre está sincronizado con los tokens.
+
+**Problema conocido**: `pad_mask` se construye comparando contra un único `pad_id` global, pero el preprocesamiento tiene `pad_id` distinto por modalidad:
+
+* categoría: `pad_id = C + 1`
+* geometría: `pad_id = BINS + 1`
+
+La corrección correcta es construir `pad_mask` por modalidad:
+
+```python
+pad_mask = torch.zeros_like(tokens, dtype=torch.bool)
+for a, m in enumerate(["c", "x", "y", "w", "h"]):
+    pad_mask[:, a] = (tokens[:, a] == vocab_meta[m]["pad_id"])
+```
+
+---
+
+## 14.4. `make_transition_params` y `build_Qt` — el schedule de corrupción
+
+### `make_transition_params`
+
+```python
+def make_transition_params(t: int, T: int):
+    s = t / T
+    gamma_t = math.sin(s * math.pi / 2) ** 2   # 0..1 creciente
+    beta_t  = 0.01 * (1.0 - gamma_t)           # pequeño
+    alpha_t = 1.0 - gamma_t
+    return alpha_t, beta_t, gamma_t
+```
+
+Define tres probabilidades para el proceso de corrupción de un token en el paso `t`:
+
+| Parámetro | Significado |
+|---|---|
+| `alpha_t` | probabilidad de **conservar** el token original |
+| `beta_t` | probabilidad de **reemplazar** por otra clase normal (uniforme) |
+| `gamma_t` | probabilidad de **enmascarar** con `[MASK]` |
+
+`gamma_t` crece suavemente de 0 a 1 usando una curva seno: a `t=0` nada se enmascara; a `t=T` casi todo está en `[MASK]`. Esta forma viene de los schedules cosine / sine usados en VQ-Diffusion y LayoutDM.
+
+**Nota**: esta implementación es una aproximación razonablemente fiel pero no idéntica al paper. El schedule exacto requiere precalcular los arrays `alpha_bar_t` acumulados de forma distinta. Esto es uno de los puntos pendientes de validación.
+
+### `build_Qt`
+
+```python
+def build_Qt(V, alpha_t, beta_t, gamma_t, mask_id, device):
+    Qt = torch.zeros((V, V), ...)
+    for i in normal_ids:
+        Qt[i, i]       = alpha_t + beta_t        # prob de quedarse
+        Qt[i, j!=i]    = beta_t                  # prob de ir a otra clase
+        Qt[i, mask_id] = gamma_t
+        Qt[i] = Qt[i] / Qt[i].sum()             # renormalizar por fila
+    Qt[mask_id, mask_id] = 1.0                   # MASK es absorbente
+    return Qt
+```
+
+Construye la matriz de transición `Q_t[V, V]` para una modalidad. Cada fila es una distribución categórica que dice: "si estoy en el token `i`, ¿con qué probabilidad voy a cada token en el siguiente paso de corrupción?".
+
+**Por qué `MASK` es absorbente**: una vez un token cae en `[MASK]`, no vuelve a ser normal. Esto permite el proceso de revelación gradual en el sampling reverso — el modelo aprende a revelar tokens de `[MASK]` hacia tokens válidos.
+
+**Por qué se renormaliza por fila**: los parámetros `alpha + beta + gamma` no siempre suman exactamente 1 por restricciones numéricas; la renormalización garantiza que cada fila sea una distribución válida.
+
+**Por qué una `Qt` por modalidad y no una sola global**: cada modalidad tiene un vocabulario distinto (categoría tiene `C+2` tokens; geometría tiene `BINS+2`). Mezclar vocabularios produciría índices sin sentido.
+
+---
+
+## 14.5. `precompute_Q_mats` — precómputo de las matrices de transición
+
+```python
+def precompute_Q_mats(cfg, vocab_meta, device):
+    Qts_all  = {m: {} for m in vocab_meta}    # Qt[t]   para t=1..T
+    Qbars_all = {m: {} for m in vocab_meta}   # Qbar[t] para t=0..T
+
+    for m, meta in vocab_meta.items():
+        Qbar = torch.eye(V, device=device)     # Qbar[0] = I (identidad)
+        Qbars_all[m][0] = Qbar.clone()
+
+        for t in range(1, cfg.T + 1):
+            Qt = build_Qt(...)
+            Qts_all[m][t] = Qt
+            Qbar = Qt @ Qbar                  # acumulación izquierda
+            Qbars_all[m][t] = Qbar.clone()
+```
+
+**Por qué precalcular**: `build_Qt` y la multiplicación matricial son costosas. Si se calcularan en cada paso del training loop, el cuello de botella estaría en el CPU/setup, no en el modelo. Precalcular una sola vez al inicio tiene un costo de memoria aceptable (T × 5 matrices).
+
+**Indexación**: `Qts_all[m][t]` usa `t` directamente como clave de diccionario (1 a T), y `Qbars_all[m][0]` es la identidad. Esto evita el bug de off-by-one que ocurre con listas 0-indexadas accedidas con índices 1-based.
+
+**`Qbar_t = Q_t @ Qbar_{t-1}`**: la acumulación izquierda es la forma correcta de obtener la distribución marginal `q(z_t | z_0)` en un solo paso desde `z_0`:
+
+$$\bar{Q}_t = Q_t \cdot Q_{t-1} \cdot \ldots \cdot Q_1$$
+
+---
+
+## 14.6. `q_sample_from_Qbar` — corrupción forward
+
+```python
+def q_sample_from_Qbar(z0, Qbar_t):
+    probs = Qbar_t[z0]          # [B, L, V]  — fila de Qbar correspondiente a cada token
+    return categorical_sample(probs)
+```
+
+Dado `z_0` (tokens limpios) y `Qbar_t` (distribución acumulada hasta `t`), muestrea `z_t ~ q(z_t | z_0)`.
+
+**Por qué `Qbar_t[z0]`**: indexar una matriz con un tensor de índices es un lookup eficiente en PyTorch. Cada posición de `z0` selecciona la fila de `Qbar_t` correspondiente a ese token, que es exactamente su distribución de transición acumulada.
+
+**Esta función es el punto pendiente más importante de validar**: si `Qbar_t` no está bien calculada, toda la corrupción forward es incorrecta y el modelo aprende una tarea que no corresponde al paper.
+
+---
+
+## 14.7. `q_posterior_true` — el posterior verdadero
+
+```python
+def q_posterior_true(z0, zt, Qt, Qbar_t_1):
+    probs_t1_given_z0 = Qbar_t_1[z0]                       # [B,L,V]
+    Qt_col = Qt[:, zt].permute(1, 2, 0)                    # [B,L,V]
+    unnorm = Qt_col * probs_t1_given_z0
+    return unnorm / (unnorm.sum(dim=-1, keepdim=True) + 1e-12)
+```
+
+Calcula la distribución verdadera:
+
+$$q(z_{t-1} \mid z_t, z_0) \propto q(z_t \mid z_{t-1}) \cdot q(z_{t-1} \mid z_0)$$
+
+**`Qt_col = Qt[:, zt]`**: extrae la columna `zt` de `Qt`, es decir, la probabilidad `q(z_t | z_{t-1})` para cada candidato `z_{t-1}`. Se hace indexando por columna y luego permutando a `[B, L, V]`.
+
+**Por qué esta fórmula**: en difusión discreta el posterior verdadero es tratable analíticamente gracias a la estructura markoviana del proceso forward. Esta fórmula proviene directamente de la regla de Bayes y es la que el modelo debe aprender a aproximar.
+
+**`+ 1e-12`**: previene división por cero en posiciones donde todos los candidatos tienen probabilidad cero (raro pero posible con tokens fuera de distribución).
+
+---
+
+## 14.8. `LayoutDMDenoiser` — el modelo Transformer
+
+### Por qué Transformer encoder (no decoder)
+
+LayoutDM modela el layout completo en paralelo, no elemento a elemento. El Transformer encoder aplica self-attention sobre toda la secuencia simultáneamente, sin máscara causal. Esto permite que la categoría de un elemento influya en la geometría de otro elemento en la misma pasada.
+
+Un decoder autoregresivo generaría un token de cada vez (izquierda a derecha), lo cual introduciría un orden artificial en un problema donde el orden de los elementos no debería importar.
+
+### Embeddings por modalidad
+
+```python
+self.emb = nn.ModuleDict({
+    m: nn.Embedding(vocab_sizes[m], cfg.d_model) for m in self.modalities
+})
+```
+
+Cada modalidad tiene su propio embedding porque los vocabularios son distintos e incompatibles. Un vocabulario compartido mezclaría `c_id=3` (categoría "Button") con `x_id=3` (bin de posición horizontal cercano al margen izquierdo), que no tienen ninguna relación semántica.
+
+### Positional encodings desacoplados
+
+```python
+self.elem_pos = nn.Embedding(cfg.M, cfg.d_model)   # posición del elemento
+self.attr_pos = nn.Embedding(5, cfg.d_model)        # posición del atributo
+```
+
+Se usan dos tipos de embeddings posicionales sumados:
+
+* `elem_pos`: indica qué elemento es (primero, segundo, ..., M-ésimo)
+* `attr_pos`: indica qué atributo es (c=0, x=1, y=2, w=3, h=4)
+
+Sin positional encoding, el Transformer no puede distinguir si un token pertenece al elemento 5 o al elemento 12. Sin `attr_pos`, no sabría si está procesando una coordenada `x` o un ancho `w`.
+
+### El `forward()` y el problema del flatten
+
+```python
+reps = []
+for a, m in enumerate(self.modalities):
+    e = self.emb[m](zt[:, :, a])                       # [B,M,D]
+    e = e + self.elem_pos(elem_ids) + self.attr_pos(...)
+    reps.append(e)
+
+x = torch.cat(reps, dim=1)          # [B, M*5, D]  ← concatenación en la dim de secuencia
+```
+
+**Este es el bug del flatten por bloques** documentado en la sección 8.4. `torch.cat(reps, dim=1)` concatena los `M` tokens de cada modalidad uno detrás del otro, resultando en:
+
+```
+[c1..cM, x1..xM, y1..yM, w1..wM, h1..hM]
+```
+
+El Transformer ve primero todas las categorías juntas, luego todas las `x`, etc. Puede aprender relaciones entre la categoría del elemento 3 y la categoría del elemento 7, pero **no** entre la categoría del elemento 3 y su propia posición `x`.
+
+**La corrección** requiere secuencia intercalada:
+
+```python
+# stack: [B, M, 5, D]
+x = torch.stack(reps, dim=2)
+# intercalar: [B, 5M, D]
+x = x.reshape(B, M * 5, cfg.d_model)
+```
+
+Y la extracción de outputs:
+
+```python
+h = h.reshape(B, M, 5, cfg.d_model)
+for a, m in enumerate(self.modalities):
+    out[m] = self.head[m](h[:, :, a, :])    # [B, M, V_m]
+```
+
+Con esto la secuencia queda:
+
+```
+[c1, x1, y1, w1, h1, c2, x2, y2, w2, h2, ...]
+```
+
+y el Transformer puede atender a todos los atributos del mismo elemento juntos.
+
+### Por qué `norm_first=True` en el TransformerEncoderLayer
+
+La variante `norm_first` (Pre-LN) aplica LayerNorm antes de cada sublayer en lugar de después. Es más estable durante el entrenamiento — los gradientes fluyen mejor hacia las capas inferiores. LayoutDM y la mayoría de Transformers modernos lo usan por defecto.
+
+---
+
+## 14.9. `compute_losses` — la función de pérdida
+
+```python
+def compute_losses(cfg, logits, z0, zt, t, Qts_t, Qbars_prev, pad_mask):
+    for a, m in enumerate(modalities):
+        valid = (~pad_mask[:, :, a]).float()       # 1.0 donde no hay PAD
+        denom = valid.sum().clamp_min(1.0)         # evitar div/0
+
+        q_true = q_posterior_true(z0, zt, Qts_t[m], Qbars_prev[m])
+        p_model = F.softmax(logits[m], dim=-1)
+
+        kl = kl_categorical(q_true, p_model)       # [B,M]
+        vb = (kl * valid).sum() / denom
+
+        ce = F.cross_entropy(logits[m].reshape(-1, V), z0_m.reshape(-1), reduction="none")
+        aux = (ce * valid).sum() / denom
+
+    total = vb_loss + cfg.lambda_aux * aux_loss
+```
+
+### VB loss (variational bound)
+
+Minimiza el KL entre el posterior verdadero `q(z_{t-1} | z_t, z_0)` y la distribución predicha por el modelo `p_θ(z_{t-1} | z_t)`. Este es el objetivo principal del paper — el modelo aprende a aproximar la reversión del proceso forward.
+
+### Aux loss (pérdida auxiliar)
+
+Cross-entropy para reconstruir directamente `z_0` desde los logits. No está fundamentada en la formulación probabilística estricta, pero aporta una señal de entrenamiento más directa que estabiliza el aprendizaje, especialmente en los primeros pasos cuando el modelo no ha aprendido nada todavía.
+
+### Por qué dividir por `valid.sum()` y no por `B*M`
+
+La pérdida debe calcularse **solo sobre tokens que no son PAD**. Si un layout tiene 5 elementos reales y `M-5 = 20` posiciones de PAD, los 20 PADs no deberían contribuir. Dividir por `B*M` daría una señal diluida que favorece a los layouts cortos. Dividir por `valid.sum()` normaliza correctamente.
+
+### Por qué `clamp_min(1.0)` en `denom`
+
+Si por alguna razón todos los tokens de un batch son PAD (no debería ocurrir, pero es defensa), `denom = 0` produciría NaN. El `clamp_min(1.0)` evita esa situación.
+
+---
+
+## 14.10. `train_one_epoch` — el loop de entrenamiento
+
+```python
+for tokens, pad_mask in loader:
+    t = torch.randint(1, cfg.T + 1, (1,)).item()   # un t para todo el batch
+
+    zt = tokens.clone()
+    for a, m in enumerate(["c", "x", "y", "w", "h"]):
+        Qbar_t = Qbars_all[m][t]
+        zt[:, :, a] = q_sample_from_Qbar(tokens[:, :, a], Qbar_t)
+        Qts_t[m]    = Qts_all[m][t]
+        Qbars_prev[m] = Qbars_all[m][t - 1]
+
+    logits = model(zt)
+    loss, metrics = compute_losses(...)
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
+    opt.step()
+```
+
+**Un único `t` por batch**: samplear un solo timestep para todo el batch es la práctica estándar en difusión. Equivale a hacer un estimador Monte Carlo del objetivo ELBO — en expectativa sobre todos los batches se cubren todos los timesteps.
+
+**`set_to_none=True` en `zero_grad`**: más eficiente que poner los gradientes a cero — libera memoria en lugar de sobreescribir con ceros.
+
+**La corrupción se hace por modalidad**: `q_sample_from_Qbar` se llama una vez por modalidad con su `Qbar_t` específica. Así cada modalidad sigue su propia dinámica de corrupción con su vocabulario propio.
+
+---
+
+## 14.11. `unconditional_sample` — el sampling reverso
+
+```python
+zt = MASK para todo    # z_T
+
+for t in range(T, 0, -1):
+    logits = model(zt)
+    for a, m in enumerate(modalities):
+        probs = F.softmax(logits[m], dim=-1)
+        sampled = torch.multinomial(probs.reshape(-1, V), 1).view(B, M)
+        z_prev[:, :, a] = sampled
+
+    # regla de coherencia: si c == PAD, forzar x/y/w/h a PAD
+    c_pad = (z_prev[:, :, 0] == pad_ids["c"])
+    z_prev[:, :, 1:] = torch.where(c_pad[..., None], pad_value, z_prev[:, :, 1:])
+
+    zt = z_prev
+```
+
+**Por qué iniciar en `[MASK]`**: el proceso forward lleva `z_0 → z_T` donde `z_T` es casi todo `[MASK]`. El sampling reverso debe partir de ese mismo estado.
+
+**Sampling directo desde los logits**: en cada paso `t` se samplea `z_{t-1}` directamente desde la distribución predicha por el modelo. No se usa el posterior verdadero `q(z_{t-1} | z_t, z_0)` porque en inferencia no se conoce `z_0` — eso es exactamente lo que se quiere generar.
+
+**Regla de coherencia para PAD**: si el modelo genera `PAD` para la categoría de un slot, se fuerza a que todos los atributos geométricos de ese slot también sean `PAD`. Sin esto, el modelo podría generar una coordenada `x` para una posición que conceptualmente es vacía, produciendo basura visual.
+
+**Sospechoso principal de baja calidad**: este bloque es el que con más probabilidad está mal calibrado. El sampling directo desde logits ignora la estructura del posterior `q(z_{t-1} | z_t, z_0)`. Una implementación más fiel al paper usaría los logits para obtener `p(z_0 | z_t)` y luego marginalizaría sobre el posterior verdadero.
+
+---
+
+## 14.12. Resumen de decisiones de diseño
+
+| Decisión | Razón |
+|---|---|
+| Transformer encoder (no decoder) | El layout es un conjunto no ordenado — no existe un orden izquierda-derecha natural |
+| Difusión por modalidad (no conjunta) | Cada modalidad tiene vocabulario propio — mezclarlos produciría índices sin sentido |
+| `Qbar_t` precalculada | Costosa de calcular en cada step; estable en memoria para T=100 |
+| Indexación dict `{t: Qt}` | Evita el off-by-one de listas 0-indexadas con timesteps 1-based |
+| Aux loss con CE | Señal más directa que estabiliza el entrenamiento, peso pequeño `lambda=0.1` |
+| `valid` mask en la pérdida | PAD no debe contribuir a la señal de gradiente |
+| Regla de coherencia PAD en sampling | Evita generar geometría en posiciones vacías |
+
+## 14.13. Qué ya funciona
 
 * carga `tokens_*.pt` reales desde disco ✅
 * lee `vocab_meta.json` y usa `M` real ✅
-* construye `pad_mask` correcto por modalidad ✅
-* flatten intercalado por elemento ✅
-* shuffle de elementos validado ✅
-* schedule forward exacto implementado ✅
+* `pad_mask` correcto por modalidad ✅
+* positional encodings desacoplados ✅
+* schedule matemáticamente consistente ✅
+* `Qbar_t` precalculada con indexación correcta ✅
 * ejecuta entrenamiento sin errores ✅
 * guarda checkpoint ✅
 * genera muestras renderizables ✅
 
-## Qué sigue faltando
+## 14.14. Qué sigue pendiente de corregir
 
-* validar `q_sample()` visualmente — comprobar degradación gradual de muestras reales
-* revisión del sampling reverso (`q_sample_from_Qbar`, `compute_losses`, `unconditional_sample`)
-* reentrenar corrida corta con todas las correcciones activas
-* mejor validación cualitativa comparando real vs generado
+| Componente | Problema |
+|---|---|
+| `forward()` | Flatten por bloques de modalidad en lugar de intercalado por elemento (sección 8.4) |
+| `LayoutTokenDataset` | `pad_mask` usa un único `pad_id` global en lugar de uno por modalidad |
+| `unconditional_sample` | Sampling directo desde logits — no usa el posterior verdadero `q(z_{t-1} \| z_t, z_0)` |
+| `q_sample_from_Qbar` | No validada visualmente — comprobar degradación real en distintos `t` |
 
 ## Cómo se prueba el resultado
 
@@ -711,6 +1060,7 @@ No con accuracy tradicional. Se genera y renderiza. Las preguntas clave:
 ---
 
 # 15. Estado actual del proyecto
+
 
 ## Ya resuelto
 
