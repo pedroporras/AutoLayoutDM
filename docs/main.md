@@ -60,24 +60,25 @@ Al inicio ya existían varias piezas importantes:
 * arquitectura general de LayoutDM (Transformer encoder como denoiser)
 * training loop base con pérdida `VB + auxiliary`
 * muestreo incondicional básico
-* blueprint del modelo
+* blueprint del modelo (**iter1 del entrenador** — `layoutdm_trainer.py`, primera versión)
 * pipeline inicial de preprocesamiento de RICO
 
-Había una base funcional para arrancar.
+Había una base funcional para arrancar, pero el entrenador iter1 usaba datos **completamente ficticios**: tokens aleatorios generados en memoria, sin ninguna conexión con RICO.
 
 ## 3.2. Qué faltaba o estaba incompleto
 
 También había brechas importantes:
 
-* el dataset real de RICO no estaba conectado al blueprint (usaba datos dummy)
+* **el entrenador iter1 usaba un dataset dummy** — tokens aleatorios en lugar de datos reales de RICO; cualquier resultado en iter1 no tenía validez sobre el dominio real
 * no estaba validado que el preprocesamiento fuera compatible con el blueprint
 * faltaba el shuffle por elemento
 * faltaban sanity checks visuales sólidos
 * el schedule del paper no era exacto
 * el flatten del modelo no seguía la estructura intercalada del paper
 * `M` estaba fijo en `25` en lugar de calcularse desde los datos reales
+* `pad_mask` usaba un único `pad_id` global en lugar de uno por modalidad
 
-La conclusión fue clara: antes de optimizar o comparar métricas, había que cerrar bien el pipeline real de datos y entrenamiento.
+La conclusión fue clara: antes de optimizar o comparar métricas, había que conectar el entrenador iter1 con datos reales. Eso dio origen al **iter2 del entrenador**.
 
 ---
 
@@ -301,9 +302,23 @@ Solución: construir `pad_mask` iterando solo sobre `["c", "x", "y", "w", "h"]`.
 
 El modelo usaba `M=25` fijo. Con datos reales, el valor calculado fue `M=55`. Hubo que propagar este valor desde `vocab_meta.json`.
 
-## 8.3. Dataset dummy en el blueprint
+## 8.3. Dataset dummy en el blueprint (iter1) → datos reales (iter2)
 
-El modelo creaba un dataset falso en memoria. Se cambió para leer `tokens_train.pt` y `tokens_val.pt` desde disco.
+El entrenador iter1 incluía una función `load_or_make_dataset` que generaba tokens completamente aleatorios en memoria:
+
+* creaba tensores `[N, M, 5]` con valores enteros al azar dentro del rango de vocabs
+* forzaba los últimos 5 slots a `PAD`
+* **no tenía ninguna conexión con RICO** — el modelo entrenaba sobre ruido sin sentido
+
+Esto servía para depurar la parte matemática (KL, Qt, Qbar) sin depender de datos externos, pero cualquier generación producida era inválida como evaluación real del modelo.
+
+El entrenador iter2 reemplazó completamente este bloque con:
+
+* `load_real_dataset(data_dir, split)`: carga `tokens_train.pt` / `tokens_val.pt` desde disco con validación de shape
+* `load_vocab_meta(data_dir)`: carga `vocab_meta.json` con validación de claves requeridas
+* `load_real_datasets(cfg, data_dir)`: orquesta la carga y sobreescribe `cfg.M` desde el JSON para garantizar consistencia con los artefactos reales
+
+A partir de iter2, el modelo entrena sobre los 52 956 layouts reales de RICO.
 
 ## 8.4. Flatten no compatible con el paper
 
@@ -653,6 +668,25 @@ Si renderizas `tokens_val.pt` reales y los layouts se ven plausibles, el preproc
 # 14. Implementación del entrenador: `layoutdm_trainer.py`
 
 Esta sección documenta el código del entrenador, explica cada componente, las decisiones de diseño tomadas y los puntos que aún requieren corrección.
+
+---
+
+## 14.0. Iter1 vs Iter2: por qué se rehízo el entrenador
+
+El entrenador tiene dos iteraciones con una diferencia fundamental:
+
+| | Iter1 (blueprint inicial) | Iter2 (versión actual) |
+|---|---|---|
+| **Datos** | Dataset dummy — tokens aleatorios generados en memoria | Datos reales de RICO — carga `tokens_*.pt` desde disco |
+| **`pad_mask`** | Un único `pad_id` global para todas las modalidades | `pad_id` distinto por modalidad (`C+1` para categoría, `BINS+1` para geometría) |
+| **`M`** | Hardcodeado a `25` | Leído desde `vocab_meta.json` y propagado a `cfg.M` |
+| **Shuffle** | No implementado | `_shuffle_valid_elements()` — permuta solo elementos reales, respeta PAD tail |
+| **Decodificación / render** | No incluido | `decode_layout()` + `render_layout()` + grid de 20 muestras de validación |
+| **Checkpoint** | Solo `model_state` | `model_state` + `cfg.__dict__` + `vocab_meta` |
+
+El iter1 era válido para verificar que las matemáticas del proceso de difusión no crashearan. **No era válido para evaluar si el modelo aprendía layouts reales.** Cualquier generación de iter1 era ruido sobre ruido.
+
+El iter2 conecta el entrenador con los artefactos producidos por el preprocesamiento (`tokens_train.pt`, `tokens_val.pt`, `vocab_meta.json`, `centroids_*.pt`, `cat2id.json`) y hace que el entrenamiento y la evaluación sean sobre datos reales de RICO.
 
 ---
 

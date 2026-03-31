@@ -5,6 +5,36 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es/).
 
 ---
 
+## [Trainer iter 2 — layoutdm_trainer.py] — 2026-03-30
+
+### Corregido
+- **Bug crítico: `LayoutTokenDataset` usaba un único `pad_token_id` global para construir `pad_mask`.**  
+  En iter1, todos los atributos se comparaban contra el mismo `pad_id`, pero la tokenización de iter3/iter4 tiene `pad_id` distinto por modalidad (`C+1` para categoría, `BINS+1` para geometría). Esto producía que las posiciones PAD de las modalidades geométricas no se enmascararan correctamente.  
+  **Fix**: `LayoutTokenDataset` ahora acepta `vocab_meta: Dict[str, Dict[str, int]]`; construye `self.pad_ids = [vocab_meta[m]["pad_id"] for m in modalities]` como tensor `[5]` y usa `tokens.eq(self.pad_ids)` con broadcast para generar `pad_mask [M, 5]` correcto por modalidad.
+
+- **Dataset ficticio eliminado**: `load_or_make_dataset` (generador de tokens aleatorios) reemplazado por carga real de artefactos desde disco. El entrenamiento ya no usa datos sintéticos.
+
+### Añadido
+- `load_real_dataset(data_dir, split)`: carga `tokens_{split}.pt` con validación de existencia, tipo y shape `[N, M, 5]`.
+- `load_vocab_meta(data_dir)`: carga `vocab_meta.json` con validación de claves requeridas (`vocab_size`, `mask_id`, `pad_id` por modalidad, `M` global).
+- `load_real_datasets(cfg, data_dir, shuffle_train_elements)`: orquesta la carga de train + val + `vocab_meta`. Valida consistencia de `M` entre los tensores y el JSON; sobreescribe `cfg.M` desde `vocab_meta["M"]` para garantizar que el modelo use la dimensión real.
+- `LayoutTokenDataset._shuffle_valid_elements()`: permuta solo los elementos reales (aquellos cuya categoría ≠ `c.pad_id`), dejando el bloque PAD al final sin tocarlo. Se activa opcionalmente por flag `shuffle_elements=True`.
+- `decode_layout(tokens, vocab_meta, id2cat, centroids)`: decodifica un tensor `[M, 5]` de tokens discretos a lista de elementos con coordenadas reales `(x, y, w, h)` usando los centroides KMeans. Filtra tokens PAD/MASK con `safe_centroid_lookup`.
+- `safe_centroid_lookup(centroid_tensor, idx)`: lookup de centroide con comprobación de rango; retorna `None` para índices fuera de bounds.
+- `render_layout(ax, decoded, canvas_w, canvas_h, title)`: renderiza un layout decodificado sobre un `Axes` de matplotlib con bboxes coloreadas. Usable tanto en modo plot individual como en grids.
+- Pipeline de visualización de validación: carga 20 pantallas aleatorias de `tokens_val.pt` (o las primeras `N`) y las renderiza en grid de 4 columnas con `render_layout`. Usa `RANDOM_SEED=42` para reproducibilidad.
+- Celdas de setup de Colab: copian artefactos (`tokens_*.pt`, `vocab_meta.json`, `cat2id.json`, `centroids_*.pt`) desde Google Drive a `/content/layoutdm_rico_tokens`.
+
+### Modificado
+- `main()`:
+  - Usa `load_real_datasets()` en lugar del dataset ficticio.
+  - Crea `val_loader` separado para evaluación.
+  - El checkpoint incluye `vocab_meta` junto a `cfg.__dict__` y `model.state_dict()`.
+  - Retorna `(model, cfg, train_ds, val_ds, vocab_meta)` para uso interactivo en el notebook.
+- `cfg.M` ahora se determina en tiempo de ejecución desde `vocab_meta["M"]`; el valor hardcodeado `M=25` de iter1 queda como fallback de debug, no como valor de producción.
+
+---
+
 ## [Preprocessing iter 4.1] — 2026-03-26
 
 ### Modificado
